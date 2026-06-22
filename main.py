@@ -4,8 +4,10 @@ import os
 import tempfile
 import time
 
+import requests
 import tweepy
 from dotenv import load_dotenv
+from requests_oauthlib import OAuth1
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
@@ -26,21 +28,19 @@ MAX_HASHTAGS = int(os.getenv("MAX_HASHTAGS", "2"))
 MIN_INTERVAL = int(os.getenv("MIN_INTERVAL_SECONDS", "45"))
 GROUP_WAIT = float(os.getenv("ALBUM_WAIT_SECONDS", "2"))
 
-_keys = dict(
+twitter = tweepy.Client(
     consumer_key=os.environ["X_API_KEY"],
     consumer_secret=os.environ["X_API_SECRET"],
     access_token=os.environ["X_ACCESS_TOKEN"],
     access_token_secret=os.environ["X_ACCESS_SECRET"],
 )
-twitter = tweepy.Client(**_keys)
-twitter_v1 = tweepy.API(
-    tweepy.OAuth1UserHandler(
-        _keys["consumer_key"],
-        _keys["consumer_secret"],
-        _keys["access_token"],
-        _keys["access_token_secret"],
-    )
+_oauth = OAuth1(
+    os.environ["X_API_KEY"],
+    os.environ["X_API_SECRET"],
+    os.environ["X_ACCESS_TOKEN"],
+    os.environ["X_ACCESS_SECRET"],
 )
+MEDIA_URL = "https://api.x.com/2/media/upload"
 
 _last_post = 0.0
 _groups = {}
@@ -52,19 +52,73 @@ def _allowed(chat):
     return str(chat.id) in CHANNELS or (chat.username or "") in CHANNELS
 
 
-def _upload(path, category, chunked):
-    media = twitter_v1.media_upload(filename=path, chunked=chunked, media_category=category)
-    return media.media_id_string
+def _media_id(payload):
+    data = payload.get("data", payload)
+    return str(data.get("id") or data.get("media_id_string") or data.get("media_id"))
 
 
-async def _download_and_upload(tg_file, suffix, category, chunked=False):
+def _upload_image(path):
+    with open(path, "rb") as fh:
+        r = requests.post(
+            MEDIA_URL,
+            auth=_oauth,
+            files={"media": ("blob", fh, "image/jpeg")},
+            data={"media_category": "tweet_image"},
+            timeout=120,
+        )
+    if r.status_code >= 400:
+        raise RuntimeError("%s %s" % (r.status_code, r.text[:200]))
+    return _media_id(r.json())
+
+
+def _upload_video(path):
+    size = os.path.getsize(path)
+    init = requests.post(
+        MEDIA_URL + "/initialize",
+        auth=_oauth,
+        json={"media_category": "tweet_video", "media_type": "video/mp4", "total_bytes": size},
+        timeout=60,
+    )
+    if init.status_code >= 400:
+        raise RuntimeError("init %s %s" % (init.status_code, init.text[:200]))
+    media_id = _media_id(init.json())
+    with open(path, "rb") as fh:
+        idx = 0
+        while True:
+            chunk = fh.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            ap = requests.post(
+                "%s/%s/append" % (MEDIA_URL, media_id),
+                auth=_oauth,
+                data={"segment_index": idx},
+                files={"media": ("blob", chunk, "application/octet-stream")},
+                timeout=180,
+            )
+            if ap.status_code >= 400:
+                raise RuntimeError("append %s %s" % (ap.status_code, ap.text[:200]))
+            idx += 1
+    fin = requests.post("%s/%s/finalize" % (MEDIA_URL, media_id), auth=_oauth, timeout=60)
+    if fin.status_code >= 400:
+        raise RuntimeError("finalize %s %s" % (fin.status_code, fin.text[:200]))
+    info = (fin.json().get("data") or {}).get("processing_info")
+    while info and info.get("state") in ("pending", "in_progress"):
+        time.sleep(info.get("check_after_secs", 3))
+        st = requests.get("%s/%s" % (MEDIA_URL, media_id), auth=_oauth, timeout=60)
+        if st.status_code >= 400:
+            break
+        info = (st.json().get("data") or {}).get("processing_info")
+    return media_id
+
+
+async def _grab(tg_file, suffix, uploader):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.close()
     try:
         await tg_file.download_to_drive(tmp.name)
-        return await asyncio.to_thread(_upload, tmp.name, category, chunked)
+        return await asyncio.to_thread(uploader, tmp.name)
     except Exception as exc:
-        log.error("media upload failed: %s", exc)
+        log.error("media failed: %s", exc)
         return None
     finally:
         try:
@@ -74,29 +128,21 @@ async def _download_and_upload(tg_file, suffix, category, chunked=False):
 
 
 async def collect_media(msgs):
-    photos, videos, gifs = [], [], []
+    photos, videos = [], []
     for m in msgs:
         if m.photo:
-            f = await m.photo[-1].get_file()
-            mid = await _download_and_upload(f, ".jpg", "tweet_image")
+            mid = await _grab(await m.photo[-1].get_file(), ".jpg", _upload_image)
             if mid:
                 photos.append(mid)
-        elif m.video:
-            f = await m.video.get_file()
-            mid = await _download_and_upload(f, ".mp4", "tweet_video", chunked=True)
+        elif m.video or m.animation:
+            src = m.video or m.animation
+            mid = await _grab(await src.get_file(), ".mp4", _upload_video)
             if mid:
                 videos.append(mid)
-        elif m.animation:
-            f = await m.animation.get_file()
-            mid = await _download_and_upload(f, ".mp4", "tweet_gif", chunked=True)
-            if mid:
-                gifs.append(mid)
     if photos:
         return photos[:4]
     if videos:
         return videos[:1]
-    if gifs:
-        return gifs[:1]
     return []
 
 
