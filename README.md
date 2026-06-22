@@ -1,27 +1,31 @@
 # CryptoNewsX
 
-Watches one or more Telegram channels and reposts new messages to an X account.
+A Telegram bot that watches a channel and reposts new messages to an X account.
 Before posting it strips `@` mentions, removes emojis, drops promo/`t.me` lines,
 and turns up to two relevant keywords into inline hashtags.
 
+## How it works
+
+The bot must be an **admin** of the source channel. Once it is, Telegram delivers
+every new channel post to the bot, which cleans the text and posts it to X.
+
 ## Setup
 
-1. Install dependencies:
+1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
+
+2. Add the bot to your channel as an **administrator** (it does not need any
+   permissions beyond being a member admin to receive posts). In BotFather also
+   run `/setprivacy` is not required for channels, but make sure the bot is admin.
+
+3. Install dependencies:
 
        python3 -m venv venv
        source venv/bin/activate
        pip install -r requirements.txt
 
-2. Copy `.env.example` to `.env` and fill in the values (see below).
+4. Copy `.env.example` to `.env` and fill in the values (see below).
 
-3. Generate a Telegram session string once (run on your own machine, it asks
-   for your phone number and the login code):
-
-       python session_setup.py
-
-   Paste the printed `TELEGRAM_SESSION=...` line into `.env`.
-
-4. Run it:
+5. Run it:
 
        python main.py
 
@@ -29,13 +33,15 @@ and turns up to two relevant keywords into inline hashtags.
 
 | Variable | What it is |
 | --- | --- |
-| `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` | Telegram app credentials |
-| `TELEGRAM_SESSION` | Session string from `session_setup.py` |
-| `SOURCE_CHANNELS` | Comma-separated channel usernames or numeric ids |
+| `TELEGRAM_BOT_TOKEN` | Bot token from BotFather |
+| `SOURCE_CHANNELS` | Comma-separated channel ids or usernames to allow (leave empty to accept every channel the bot is in) |
 | `X_API_KEY` / `X_API_SECRET` | X app consumer keys |
-| `X_ACCESS_TOKEN` / `X_ACCESS_SECRET` | X access token for the posting account |
+| `X_ACCESS_TOKEN` / `X_ACCESS_SECRET` | X access token for the posting account (needs Read and Write) |
 | `MAX_HASHTAGS` | Max inline hashtags per post (default 2) |
 | `MIN_INTERVAL_SECONDS` | Minimum gap between posts (default 45) |
+
+To find a channel id, forward a channel post to [@userinfobot](https://t.me/userinfobot)
+or read it from the bot logs. Channel ids look like `-1001234567890`.
 
 The hashtag keyword list lives in `processor.py` (`TERMS`). Add or remove terms
 there to control what gets tagged.
