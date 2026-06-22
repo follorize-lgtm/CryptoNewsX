@@ -63,9 +63,7 @@ def _processing(payload):
 
 def _init_media(size, media_type, category):
     body = {"media_category": category, "media_type": media_type, "total_bytes": size}
-    r = requests.post(MEDIA_URL, auth=_oauth, json=body, timeout=60)
-    if r.status_code >= 400:
-        r = requests.post(MEDIA_URL + "/initialize", auth=_oauth, json=body, timeout=60)
+    r = requests.post(MEDIA_URL + "/initialize", auth=_oauth, json=body, timeout=60)
     if r.status_code >= 400:
         raise RuntimeError("init %s %s" % (r.status_code, r.text[:200]))
     return _media_id(r.json())

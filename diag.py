@@ -1,4 +1,6 @@
 import os
+import struct
+import zlib
 
 import requests
 from dotenv import load_dotenv
@@ -13,12 +15,19 @@ oauth = OAuth1(
     os.environ["X_ACCESS_SECRET"],
 )
 
-png = bytes.fromhex(
-    "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
-    "1f15c4890000000d4944415478da6364f80f00010101001b2d5c0e0000"
-    "000049454e44ae426082"
-)
 
+def make_png(w, h):
+    def chunk(typ, data):
+        body = typ + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    raw = b"".join(b"\x00" + b"\x29\x86\xc7" * w for _ in range(h))
+    idat = zlib.compress(raw, 9)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+png = make_png(200, 200)
 BASE = "https://api.x.com/2/media/upload"
 body = {"media_category": "tweet_image", "media_type": "image/png", "total_bytes": len(png)}
 
@@ -32,13 +41,9 @@ def get_id(resp):
     return d.get("id") or d.get("media_id_string") or d.get("media_id")
 
 
-a = requests.post(BASE, auth=oauth, json=body, timeout=60)
-print("INIT base:", a.status_code, a.text[:250])
-mid = get_id(a)
-if not mid:
-    b = requests.post(BASE + "/initialize", auth=oauth, json=body, timeout=60)
-    print("INIT /initialize:", b.status_code, b.text[:250])
-    mid = get_id(b)
+init = requests.post(BASE + "/initialize", auth=oauth, json=body, timeout=60)
+print("INIT:", init.status_code, init.text[:250])
+mid = get_id(init)
 print("MEDIA_ID:", mid)
 
 if mid:
