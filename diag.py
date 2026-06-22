@@ -21,35 +21,30 @@ png = bytes.fromhex(
 
 BASE = "https://api.x.com/2/media/upload"
 
-print("== A: simple + media_type ==")
-r = requests.post(
+init = requests.post(
     BASE,
     auth=oauth,
-    files={"media": ("blob", png, "image/png")},
-    data={"media_category": "tweet_image", "media_type": "image/png"},
+    data={"command": "INIT", "total_bytes": len(png), "media_type": "image/png", "media_category": "tweet_image"},
     timeout=60,
 )
-print("A status:", r.status_code, r.text[:300])
+print("INIT:", init.status_code, init.text[:300])
+j = init.json()
+mid = (j.get("data") or j).get("id") or j.get("media_id_string") or j.get("media_id")
+print("MEDIA_ID:", mid)
 
-print("== B: chunked initialize/append/finalize ==")
-init = requests.post(
-    BASE + "/initialize",
+ap = requests.post(
+    BASE,
     auth=oauth,
-    json={"media_category": "tweet_image", "media_type": "image/png", "total_bytes": len(png)},
+    data={"command": "APPEND", "media_id": mid, "segment_index": 0},
+    files={"media": ("blob", png, "application/octet-stream")},
     timeout=60,
 )
-print("init:", init.status_code, init.text[:300])
-try:
-    mid = (init.json().get("data") or {}).get("id") or init.json().get("media_id_string")
-    ap = requests.post(
-        "%s/%s/append" % (BASE, mid),
-        auth=oauth,
-        data={"segment_index": 0},
-        files={"media": ("blob", png, "application/octet-stream")},
-        timeout=60,
-    )
-    print("append:", ap.status_code, ap.text[:300])
-    fin = requests.post("%s/%s/finalize" % (BASE, mid), auth=oauth, timeout=60)
-    print("finalize:", fin.status_code, fin.text[:300])
-except Exception as exc:
-    print("chunked error:", exc)
+print("APPEND:", ap.status_code, ap.text[:200])
+
+fin = requests.post(
+    BASE,
+    auth=oauth,
+    data={"command": "FINALIZE", "media_id": mid},
+    timeout=60,
+)
+print("FINALIZE:", fin.status_code, fin.text[:300])

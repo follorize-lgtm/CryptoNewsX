@@ -57,26 +57,16 @@ def _media_id(payload):
     return str(data.get("id") or data.get("media_id_string") or data.get("media_id"))
 
 
-def _upload_image(path):
-    with open(path, "rb") as fh:
-        r = requests.post(
-            MEDIA_URL,
-            auth=_oauth,
-            files={"media": ("blob", fh, "image/jpeg")},
-            data={"media_category": "tweet_image"},
-            timeout=120,
-        )
-    if r.status_code >= 400:
-        raise RuntimeError("%s %s" % (r.status_code, r.text[:200]))
-    return _media_id(r.json())
+def _processing(payload):
+    return (payload.get("data") or payload).get("processing_info")
 
 
-def _upload_video(path):
+def _upload(path, media_type, category):
     size = os.path.getsize(path)
     init = requests.post(
-        MEDIA_URL + "/initialize",
+        MEDIA_URL,
         auth=_oauth,
-        json={"media_category": "tweet_video", "media_type": "video/mp4", "total_bytes": size},
+        data={"command": "INIT", "total_bytes": size, "media_type": media_type, "media_category": category},
         timeout=60,
     )
     if init.status_code >= 400:
@@ -89,34 +79,44 @@ def _upload_video(path):
             if not chunk:
                 break
             ap = requests.post(
-                "%s/%s/append" % (MEDIA_URL, media_id),
+                MEDIA_URL,
                 auth=_oauth,
-                data={"segment_index": idx},
+                data={"command": "APPEND", "media_id": media_id, "segment_index": idx},
                 files={"media": ("blob", chunk, "application/octet-stream")},
                 timeout=180,
             )
             if ap.status_code >= 400:
                 raise RuntimeError("append %s %s" % (ap.status_code, ap.text[:200]))
             idx += 1
-    fin = requests.post("%s/%s/finalize" % (MEDIA_URL, media_id), auth=_oauth, timeout=60)
+    fin = requests.post(
+        MEDIA_URL,
+        auth=_oauth,
+        data={"command": "FINALIZE", "media_id": media_id},
+        timeout=60,
+    )
     if fin.status_code >= 400:
         raise RuntimeError("finalize %s %s" % (fin.status_code, fin.text[:200]))
-    info = (fin.json().get("data") or {}).get("processing_info")
+    info = _processing(fin.json())
     while info and info.get("state") in ("pending", "in_progress"):
         time.sleep(info.get("check_after_secs", 3))
-        st = requests.get("%s/%s" % (MEDIA_URL, media_id), auth=_oauth, timeout=60)
+        st = requests.get(
+            MEDIA_URL,
+            auth=_oauth,
+            params={"command": "STATUS", "media_id": media_id},
+            timeout=60,
+        )
         if st.status_code >= 400:
             break
-        info = (st.json().get("data") or {}).get("processing_info")
+        info = _processing(st.json())
     return media_id
 
 
-async def _grab(tg_file, suffix, uploader):
+async def _grab(tg_file, suffix, media_type, category):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.close()
     try:
         await tg_file.download_to_drive(tmp.name)
-        return await asyncio.to_thread(uploader, tmp.name)
+        return await asyncio.to_thread(_upload, tmp.name, media_type, category)
     except Exception as exc:
         log.error("media failed: %s", exc)
         return None
@@ -131,12 +131,12 @@ async def collect_media(msgs):
     photos, videos = [], []
     for m in msgs:
         if m.photo:
-            mid = await _grab(await m.photo[-1].get_file(), ".jpg", _upload_image)
+            mid = await _grab(await m.photo[-1].get_file(), ".jpg", "image/jpeg", "tweet_image")
             if mid:
                 photos.append(mid)
         elif m.video or m.animation:
             src = m.video or m.animation
-            mid = await _grab(await src.get_file(), ".mp4", _upload_video)
+            mid = await _grab(await src.get_file(), ".mp4", "video/mp4", "tweet_video")
             if mid:
                 videos.append(mid)
     if photos:
