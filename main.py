@@ -61,17 +61,19 @@ def _processing(payload):
     return (payload.get("data") or payload).get("processing_info")
 
 
+def _init_media(size, media_type, category):
+    body = {"media_category": category, "media_type": media_type, "total_bytes": size}
+    r = requests.post(MEDIA_URL, auth=_oauth, json=body, timeout=60)
+    if r.status_code >= 400:
+        r = requests.post(MEDIA_URL + "/initialize", auth=_oauth, json=body, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError("init %s %s" % (r.status_code, r.text[:200]))
+    return _media_id(r.json())
+
+
 def _upload(path, media_type, category):
     size = os.path.getsize(path)
-    init = requests.post(
-        MEDIA_URL,
-        auth=_oauth,
-        data={"command": "INIT", "total_bytes": size, "media_type": media_type, "media_category": category},
-        timeout=60,
-    )
-    if init.status_code >= 400:
-        raise RuntimeError("init %s %s" % (init.status_code, init.text[:200]))
-    media_id = _media_id(init.json())
+    media_id = _init_media(size, media_type, category)
     with open(path, "rb") as fh:
         idx = 0
         while True:
@@ -79,32 +81,22 @@ def _upload(path, media_type, category):
             if not chunk:
                 break
             ap = requests.post(
-                MEDIA_URL,
+                "%s/%s/append" % (MEDIA_URL, media_id),
                 auth=_oauth,
-                data={"command": "APPEND", "media_id": media_id, "segment_index": idx},
+                data={"segment_index": idx},
                 files={"media": ("blob", chunk, "application/octet-stream")},
                 timeout=180,
             )
             if ap.status_code >= 400:
                 raise RuntimeError("append %s %s" % (ap.status_code, ap.text[:200]))
             idx += 1
-    fin = requests.post(
-        MEDIA_URL,
-        auth=_oauth,
-        data={"command": "FINALIZE", "media_id": media_id},
-        timeout=60,
-    )
+    fin = requests.post("%s/%s/finalize" % (MEDIA_URL, media_id), auth=_oauth, timeout=60)
     if fin.status_code >= 400:
         raise RuntimeError("finalize %s %s" % (fin.status_code, fin.text[:200]))
     info = _processing(fin.json())
     while info and info.get("state") in ("pending", "in_progress"):
         time.sleep(info.get("check_after_secs", 3))
-        st = requests.get(
-            MEDIA_URL,
-            auth=_oauth,
-            params={"command": "STATUS", "media_id": media_id},
-            timeout=60,
-        )
+        st = requests.get("%s/%s" % (MEDIA_URL, media_id), auth=_oauth, timeout=60)
         if st.status_code >= 400:
             break
         info = _processing(st.json())

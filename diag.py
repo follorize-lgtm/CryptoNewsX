@@ -20,31 +20,35 @@ png = bytes.fromhex(
 )
 
 BASE = "https://api.x.com/2/media/upload"
+body = {"media_category": "tweet_image", "media_type": "image/png", "total_bytes": len(png)}
 
-init = requests.post(
-    BASE,
-    auth=oauth,
-    data={"command": "INIT", "total_bytes": len(png), "media_type": "image/png", "media_category": "tweet_image"},
-    timeout=60,
-)
-print("INIT:", init.status_code, init.text[:300])
-j = init.json()
-mid = (j.get("data") or j).get("id") or j.get("media_id_string") or j.get("media_id")
+
+def get_id(resp):
+    try:
+        j = resp.json()
+    except Exception:
+        return None
+    d = j.get("data") or j
+    return d.get("id") or d.get("media_id_string") or d.get("media_id")
+
+
+a = requests.post(BASE, auth=oauth, json=body, timeout=60)
+print("INIT base:", a.status_code, a.text[:250])
+mid = get_id(a)
+if not mid:
+    b = requests.post(BASE + "/initialize", auth=oauth, json=body, timeout=60)
+    print("INIT /initialize:", b.status_code, b.text[:250])
+    mid = get_id(b)
 print("MEDIA_ID:", mid)
 
-ap = requests.post(
-    BASE,
-    auth=oauth,
-    data={"command": "APPEND", "media_id": mid, "segment_index": 0},
-    files={"media": ("blob", png, "application/octet-stream")},
-    timeout=60,
-)
-print("APPEND:", ap.status_code, ap.text[:200])
-
-fin = requests.post(
-    BASE,
-    auth=oauth,
-    data={"command": "FINALIZE", "media_id": mid},
-    timeout=60,
-)
-print("FINALIZE:", fin.status_code, fin.text[:300])
+if mid:
+    ap = requests.post(
+        "%s/%s/append" % (BASE, mid),
+        auth=oauth,
+        data={"segment_index": 0},
+        files={"media": ("blob", png, "application/octet-stream")},
+        timeout=60,
+    )
+    print("APPEND:", ap.status_code, ap.text[:200])
+    fin = requests.post("%s/%s/finalize" % (BASE, mid), auth=oauth, timeout=60)
+    print("FINALIZE:", fin.status_code, fin.text[:250])
