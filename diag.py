@@ -19,13 +19,37 @@ png = bytes.fromhex(
     "000049454e44ae426082"
 )
 
-print("uploading test image to /2/media/upload ...")
+BASE = "https://api.x.com/2/media/upload"
+
+print("== A: simple + media_type ==")
 r = requests.post(
-    "https://api.x.com/2/media/upload",
+    BASE,
     auth=oauth,
     files={"media": ("blob", png, "image/png")},
-    data={"media_category": "tweet_image"},
+    data={"media_category": "tweet_image", "media_type": "image/png"},
     timeout=60,
 )
-print("STATUS:", r.status_code)
-print("BODY:", r.text)
+print("A status:", r.status_code, r.text[:300])
+
+print("== B: chunked initialize/append/finalize ==")
+init = requests.post(
+    BASE + "/initialize",
+    auth=oauth,
+    json={"media_category": "tweet_image", "media_type": "image/png", "total_bytes": len(png)},
+    timeout=60,
+)
+print("init:", init.status_code, init.text[:300])
+try:
+    mid = (init.json().get("data") or {}).get("id") or init.json().get("media_id_string")
+    ap = requests.post(
+        "%s/%s/append" % (BASE, mid),
+        auth=oauth,
+        data={"segment_index": 0},
+        files={"media": ("blob", png, "application/octet-stream")},
+        timeout=60,
+    )
+    print("append:", ap.status_code, ap.text[:300])
+    fin = requests.post("%s/%s/finalize" % (BASE, mid), auth=oauth, timeout=60)
+    print("finalize:", fin.status_code, fin.text[:300])
+except Exception as exc:
+    print("chunked error:", exc)
