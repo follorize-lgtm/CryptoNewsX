@@ -5,8 +5,8 @@ import time
 
 import tweepy
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
+from telegram import Update
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from processor import process
 
@@ -16,12 +16,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("crosspost")
 
-API_ID = int(os.environ["TELEGRAM_API_ID"])
-API_HASH = os.environ["TELEGRAM_API_HASH"]
-SESSION = os.environ["TELEGRAM_SESSION"]
-CHANNELS = [c.strip() for c in os.environ["SOURCE_CHANNELS"].split(",") if c.strip()]
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHANNELS = {c.strip().lstrip("@") for c in os.environ.get("SOURCE_CHANNELS", "").split(",") if c.strip()}
 MAX_HASHTAGS = int(os.getenv("MAX_HASHTAGS", "2"))
 MIN_INTERVAL = int(os.getenv("MIN_INTERVAL_SECONDS", "45"))
 
@@ -35,8 +34,10 @@ twitter = tweepy.Client(
 _last_post = 0.0
 
 
-def _channel(value):
-    return int(value) if value.lstrip("-").isdigit() else value
+def _allowed(chat):
+    if not CHANNELS:
+        return True
+    return str(chat.id) in CHANNELS or (chat.username or "") in CHANNELS
 
 
 def _send(text):
@@ -63,12 +64,11 @@ async def publish(text):
     return False
 
 
-client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-
-
-@client.on(events.NewMessage(chats=[_channel(c) for c in CHANNELS]))
-async def on_message(event):
-    text = process(event.message.message or "", MAX_HASHTAGS)
+async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.channel_post
+    if msg is None or not _allowed(msg.chat):
+        return
+    text = process(msg.text or msg.caption or "", MAX_HASHTAGS)
     if not text:
         return
     if len(text) > 280:
@@ -78,9 +78,10 @@ async def on_message(event):
 
 
 def main():
-    client.start()
-    log.info("watching %d channel(s)", len(CHANNELS))
-    client.run_until_disconnected()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
+    log.info("watching %s", ", ".join(CHANNELS) if CHANNELS else "all channels the bot is in")
+    app.run_polling(allowed_updates=["channel_post"])
 
 
 if __name__ == "__main__":
