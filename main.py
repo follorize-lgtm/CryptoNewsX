@@ -118,43 +118,55 @@ async def _grab(tg_file, suffix, media_type, category):
 
 
 async def collect_media(msgs):
-    photos, videos = [], []
+    items = []
     for m in msgs:
         if m.photo:
             mid = await _grab(await m.photo[-1].get_file(), ".jpg", "image/jpeg", "tweet_image")
             if mid:
-                photos.append(mid)
+                items.append((mid, "photo"))
         elif m.video or m.animation:
             src = m.video or m.animation
             mid = await _grab(await src.get_file(), ".mp4", "video/mp4", "tweet_video")
             if mid:
-                videos.append(mid)
+                items.append((mid, "video"))
+    return items
+
+
+def _batch(items):
+    groups = []
+    photos = []
+    for mid, kind in items:
+        if kind == "photo":
+            photos.append(mid)
+            if len(photos) == 4:
+                groups.append(photos)
+                photos = []
+        else:
+            if photos:
+                groups.append(photos)
+                photos = []
+            groups.append([mid])
     if photos:
-        return photos[:4]
-    if videos:
-        return videos[:1]
-    return []
+        groups.append(photos)
+    return groups
 
 
-def _send(text, media_ids):
+def _send(text, media_ids, reply_to):
     kwargs = {}
     if text:
         kwargs["text"] = text
     if media_ids:
         kwargs["media_ids"] = media_ids
-    twitter.create_tweet(**kwargs)
+    if reply_to:
+        kwargs["in_reply_to_tweet_id"] = reply_to
+    resp = twitter.create_tweet(**kwargs)
+    return resp.data["id"]
 
 
-async def publish(text, media_ids):
-    global _last_post
-    gap = MIN_INTERVAL - (time.time() - _last_post)
-    if gap > 0:
-        await asyncio.sleep(gap)
+async def _post(text, media_ids, reply_to):
     for attempt in range(3):
         try:
-            await asyncio.to_thread(_send, text, media_ids)
-            _last_post = time.time()
-            return True
+            return await asyncio.to_thread(_send, text, media_ids, reply_to)
         except tweepy.TooManyRequests:
             wait = 60 * (attempt + 1)
             log.warning("rate limited, backing off %ds", wait)
@@ -162,7 +174,26 @@ async def publish(text, media_ids):
         except Exception as exc:
             log.error("post failed: %s", exc)
             await asyncio.sleep(5 * (attempt + 1))
-    return False
+    return None
+
+
+async def publish(text, groups):
+    global _last_post
+    gap = MIN_INTERVAL - (time.time() - _last_post)
+    if gap > 0:
+        await asyncio.sleep(gap)
+    reply_to = None
+    posted = 0
+    for media_ids in (groups or [[]]):
+        body = text if posted == 0 else None
+        tweet_id = await _post(body, media_ids, reply_to)
+        if not tweet_id:
+            break
+        reply_to = tweet_id
+        posted += 1
+    if posted:
+        _last_post = time.time()
+    return posted
 
 
 async def handle(msgs):
@@ -172,13 +203,15 @@ async def handle(msgs):
         if raw:
             break
     text = process(raw, MAX_HASHTAGS)
-    media_ids = await collect_media(msgs)
-    if not text and not media_ids:
+    items = await collect_media(msgs)
+    groups = _batch(items)
+    if not text and not groups:
         return
     if len(text) > 280:
         text = text[:277].rstrip() + "..."
-    if await publish(text, media_ids):
-        log.info("posted: %s [%d media]", text.replace("\n", " ")[:80], len(media_ids))
+    posted = await publish(text, groups)
+    if posted:
+        log.info("posted: %s [%d media / %d tweet(s)]", text.replace("\n", " ")[:80], len(items), posted)
 
 
 async def flush_group(gid):
