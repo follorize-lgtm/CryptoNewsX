@@ -11,6 +11,7 @@ from requests_oauthlib import OAuth1
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
+from poster import is_too_long_error, split_thread
 from processor import process
 
 load_dotenv()
@@ -27,6 +28,7 @@ CHANNELS = {c.strip().lstrip("@") for c in os.environ.get("SOURCE_CHANNELS", "")
 MAX_HASHTAGS = int(os.getenv("MAX_HASHTAGS", "2"))
 MIN_INTERVAL = int(os.getenv("MIN_INTERVAL_SECONDS", "45"))
 GROUP_WAIT = float(os.getenv("ALBUM_WAIT_SECONDS", "2"))
+THREAD_INTERVAL = float(os.getenv("THREAD_INTERVAL_SECONDS", "2"))
 
 twitter = tweepy.Client(
     consumer_key=os.environ["X_API_KEY"],
@@ -163,7 +165,7 @@ def _send(text, media_ids, reply_to):
     return resp.data["id"]
 
 
-async def _post(text, media_ids, reply_to):
+async def _post(text, media_ids, reply_to, raise_too_long=False):
     for attempt in range(3):
         try:
             return await asyncio.to_thread(_send, text, media_ids, reply_to)
@@ -172,9 +174,26 @@ async def _post(text, media_ids, reply_to):
             log.warning("rate limited, backing off %ds", wait)
             await asyncio.sleep(wait)
         except Exception as exc:
+            if raise_too_long and is_too_long_error(exc):
+                raise
             log.error("post failed: %s", exc)
             await asyncio.sleep(5 * (attempt + 1))
     return None
+
+
+async def _post_replies(posts, reply_to=None):
+    posted = 0
+    current_reply_to = reply_to
+    post_list = list(posts)
+    for index, (body, media_ids) in enumerate(post_list):
+        tweet_id = await _post(body, media_ids, current_reply_to)
+        if not tweet_id:
+            break
+        current_reply_to = tweet_id
+        posted += 1
+        if index < len(post_list) - 1 and THREAD_INTERVAL > 0:
+            await asyncio.sleep(THREAD_INTERVAL)
+    return posted
 
 
 async def publish(text, groups):
@@ -182,15 +201,43 @@ async def publish(text, groups):
     gap = MIN_INTERVAL - (time.time() - _last_post)
     if gap > 0:
         await asyncio.sleep(gap)
-    reply_to = None
-    posted = 0
-    for media_ids in (groups or [[]]):
-        body = text if posted == 0 else None
-        tweet_id = await _post(body, media_ids, reply_to)
-        if not tweet_id:
-            break
-        reply_to = tweet_id
-        posted += 1
+
+    media_groups = groups or [[]]
+    if not text:
+        posted = await _post_replies((None, media_ids) for media_ids in media_groups)
+        if posted:
+            _last_post = time.time()
+        return posted
+
+    try:
+        first_id = await _post(text, media_groups[0], None, raise_too_long=True)
+    except Exception as exc:
+        if not is_too_long_error(exc):
+            log.error("post failed: %s", exc)
+            return 0
+        parts = split_thread(text)
+        if len(parts) <= 1:
+            log.error("post failed: %s", exc)
+            return 0
+        posts = []
+        for index, part in enumerate(parts):
+            media_ids = media_groups[index] if index < len(media_groups) else []
+            posts.append((part, media_ids))
+        for media_ids in media_groups[len(parts):]:
+            posts.append((None, media_ids))
+        posted = await _post_replies(posts)
+    else:
+        if not first_id:
+            return 0
+        posted = 1
+        reply_to = first_id
+        for media_ids in media_groups[1:]:
+            tweet_id = await _post(None, media_ids, reply_to)
+            if not tweet_id:
+                break
+            reply_to = tweet_id
+            posted += 1
+
     if posted:
         _last_post = time.time()
     return posted
@@ -207,8 +254,6 @@ async def handle(msgs):
     groups = _batch(items)
     if not text and not groups:
         return
-    if len(text) > 280:
-        text = text[:277].rstrip() + "..."
     posted = await publish(text, groups)
     if posted:
         log.info("posted: %s [%d media / %d tweet(s)]", text.replace("\n", " ")[:80], len(items), posted)
