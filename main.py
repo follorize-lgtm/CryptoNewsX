@@ -96,10 +96,18 @@ def _upload(path, media_type, category):
     info = _processing(fin.json())
     while info and info.get("state") in ("pending", "in_progress"):
         time.sleep(info.get("check_after_secs", 3))
-        st = requests.get("%s/%s" % (MEDIA_URL, media_id), auth=_oauth, timeout=60)
+        st = requests.get(
+            MEDIA_URL,
+            params={"command": "STATUS", "media_id": media_id},
+            auth=_oauth,
+            timeout=60,
+        )
         if st.status_code >= 400:
-            break
+            raise RuntimeError("status %s %s" % (st.status_code, st.text[:200]))
         info = _processing(st.json())
+    if info and info.get("state") == "failed":
+        error = info.get("error") or {}
+        raise RuntimeError("processing failed: %s" % (error.get("message") or error))
     return media_id
 
 
