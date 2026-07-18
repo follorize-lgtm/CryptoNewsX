@@ -129,11 +129,16 @@ async def _grab(tg_file, suffix, media_type, category):
 
 async def collect_media(msgs):
     items = []
+    photo_count = 0
     for m in msgs:
         if m.photo:
+            if photo_count >= 4:
+                log.warning("skipping extra album photo (X allows 4 images per post)")
+                continue
             mid = await _grab(await m.photo[-1].get_file(), ".jpg", "image/jpeg", "tweet_image")
             if mid:
                 items.append((mid, "photo"))
+                photo_count += 1
         elif m.video or m.animation:
             src = m.video or m.animation
             mid = await _grab(await src.get_file(), ".mp4", "video/mp4", "tweet_video")
@@ -143,21 +148,18 @@ async def collect_media(msgs):
 
 
 def _batch(items):
+    # All photos go together in the first post; X allows at most 4 images
+    # per post, so anything beyond that is dropped rather than threaded.
+    photos = [mid for mid, kind in items if kind == "photo"]
+    if len(photos) > 4:
+        log.warning("album has %d photos, keeping first 4 (X limit)", len(photos))
+        photos = photos[:4]
     groups = []
-    photos = []
-    for mid, kind in items:
-        if kind == "photo":
-            photos.append(mid)
-            if len(photos) == 4:
-                groups.append(photos)
-                photos = []
-        else:
-            if photos:
-                groups.append(photos)
-                photos = []
-            groups.append([mid])
     if photos:
         groups.append(photos)
+    for mid, kind in items:
+        if kind != "photo":
+            groups.append([mid])
     return groups
 
 
