@@ -13,7 +13,6 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from poster import is_too_long_error, split_thread
 from processor import process
-from social_publishers import SocialPublisher
 
 load_dotenv()
 
@@ -25,11 +24,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("crosspost")
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHANNELS = {
-    c.strip().lstrip("@")
-    for c in os.environ.get("SOURCE_CHANNELS", "").split(",")
-    if c.strip()
-}
+CHANNELS = {c.strip().lstrip("@") for c in os.environ.get("SOURCE_CHANNELS", "").split(",") if c.strip()}
 MAX_HASHTAGS = int(os.getenv("MAX_HASHTAGS", "2"))
 MIN_INTERVAL = int(os.getenv("MIN_INTERVAL_SECONDS", "45"))
 GROUP_WAIT = float(os.getenv("ALBUM_WAIT_SECONDS", "2"))
@@ -51,7 +46,6 @@ MEDIA_URL = "https://api.x.com/2/media/upload"
 
 _last_post = 0.0
 _groups = {}
-social = SocialPublisher()
 
 
 def _allowed(chat):
@@ -96,9 +90,7 @@ def _upload(path, media_type, category):
             if ap.status_code >= 400:
                 raise RuntimeError("append %s %s" % (ap.status_code, ap.text[:200]))
             idx += 1
-    fin = requests.post(
-        "%s/%s/finalize" % (MEDIA_URL, media_id), auth=_oauth, timeout=60
-    )
+    fin = requests.post("%s/%s/finalize" % (MEDIA_URL, media_id), auth=_oauth, timeout=60)
     if fin.status_code >= 400:
         raise RuntimeError("finalize %s %s" % (fin.status_code, fin.text[:200]))
     info = _processing(fin.json())
@@ -119,25 +111,20 @@ def _upload(path, media_type, category):
     return media_id
 
 
-async def _grab(tg_file, suffix, media_type, category, kind):
+async def _grab(tg_file, suffix, media_type, category):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.close()
     try:
         await tg_file.download_to_drive(tmp.name)
+        return await asyncio.to_thread(_upload, tmp.name, media_type, category)
     except Exception as exc:
-        log.error("Telegram media download failed: %s", exc)
+        log.error("media failed: %s", exc)
+        return None
+    finally:
         try:
             os.unlink(tmp.name)
         except OSError:
             pass
-        return None
-
-    media_id = None
-    try:
-        media_id = await asyncio.to_thread(_upload, tmp.name, media_type, category)
-    except Exception as exc:
-        log.error("X media upload failed: %s", exc)
-    return media_id, kind, tmp.name
 
 
 async def collect_media(msgs):
@@ -148,40 +135,30 @@ async def collect_media(msgs):
             if photo_count >= 4:
                 log.warning("skipping extra album photo (X allows 4 images per post)")
                 continue
-            item = await _grab(
-                await m.photo[-1].get_file(),
-                ".jpg",
-                "image/jpeg",
-                "tweet_image",
-                "photo",
-            )
-            if item:
-                items.append(item)
-                if item[0]:
-                    photo_count += 1
+            mid = await _grab(await m.photo[-1].get_file(), ".jpg", "image/jpeg", "tweet_image")
+            if mid:
+                items.append((mid, "photo"))
+                photo_count += 1
         elif m.video or m.animation:
             src = m.video or m.animation
-            item = await _grab(
-                await src.get_file(), ".mp4", "video/mp4", "tweet_video", "video"
-            )
-            if item:
-                items.append(item)
+            mid = await _grab(await src.get_file(), ".mp4", "video/mp4", "tweet_video")
+            if mid:
+                items.append((mid, "video"))
     return items
 
 
 def _batch(items):
     # All photos go together in the first post; X allows at most 4 images
     # per post, so anything beyond that is dropped rather than threaded.
-    photos = [item[0] for item in items if item[0] and item[1] == "photo"]
+    photos = [mid for mid, kind in items if kind == "photo"]
     if len(photos) > 4:
         log.warning("album has %d photos, keeping first 4 (X limit)", len(photos))
         photos = photos[:4]
     groups = []
     if photos:
         groups.append(photos)
-    for item in items:
-        mid, kind = item[:2]
-        if mid and kind != "photo":
+    for mid, kind in items:
+        if kind != "photo":
             groups.append([mid])
     return groups
 
@@ -256,7 +233,7 @@ async def publish(text, groups):
         for index, part in enumerate(parts):
             media_ids = media_groups[index] if index < len(media_groups) else []
             posts.append((part, media_ids))
-        for media_ids in media_groups[len(parts) :]:
+        for media_ids in media_groups[len(parts):]:
             posts.append((None, media_ids))
         posted = await _post_replies(posts)
     else:
@@ -285,42 +262,11 @@ async def handle(msgs):
     text = process(raw, MAX_HASHTAGS)
     items = await collect_media(msgs)
     groups = _batch(items)
-    video_path = next((path for _mid, kind, path in items if kind == "video"), None)
-    try:
-        if text or groups:
-            posted = await publish(text, groups)
-            if posted:
-                x_media_count = sum(1 for mid, _kind, _path in items if mid)
-                log.info(
-                    "posted to X: %s [%d media / %d tweet(s)]",
-                    text.replace("\n", " ")[:80],
-                    x_media_count,
-                    posted,
-                )
-
-        if video_path and social.configured_count():
-            results = await asyncio.to_thread(social.publish_video, video_path, text)
-            for result in results:
-                if result["ok"]:
-                    log.info(
-                        "posted to %s/%s: %s",
-                        result["platform"],
-                        result["name"],
-                        result["post_id"],
-                    )
-                else:
-                    log.error(
-                        "post to %s/%s failed: %s",
-                        result["platform"],
-                        result["name"],
-                        result["error"],
-                    )
-    finally:
-        for _mid, _kind, path in items:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+    if not text and not groups:
+        return
+    posted = await publish(text, groups)
+    if posted:
+        log.info("posted: %s [%d media / %d tweet(s)]", text.replace("\n", " ")[:80], len(items), posted)
 
 
 async def flush_group(gid):
@@ -351,11 +297,7 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
-    log.info(
-        "watching %s; %d Instagram/TikTok destination(s) configured",
-        ", ".join(CHANNELS) if CHANNELS else "all channels the bot is in",
-        social.configured_count(),
-    )
+    log.info("watching %s", ", ".join(CHANNELS) if CHANNELS else "all channels the bot is in")
     app.run_polling(allowed_updates=["channel_post"])
 
 
