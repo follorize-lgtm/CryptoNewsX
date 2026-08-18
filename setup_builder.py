@@ -1,4 +1,5 @@
 from html import escape
+import re
 
 from telegram import (
     BotCommand,
@@ -13,22 +14,47 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, Mes
 
 
 class OwnerSetupBuilder:
-    """Owner-only Telegram message builder matching Wabble's /misucreate UX."""
+    """Owner-only Crypto News message builder with native Telegram entity preservation."""
 
     KEY = "setup_draft"
+
+    # Same Telegram custom-emoji IDs used by the production Crypto News-style
+    # builder UI. The plain character is only a fallback for clients that do
+    # not render the custom emoji.
+    CE_INFO = "5431776939465516694"
+    CE_TICK = "5206607081334906820"
+    CE_X = "5465665476971471368"
+
     MEDIA_LABELS = {
         "photo": "📷 Photo",
         "video": "🎬 Video",
         "animation": "🎞 GIF",
-        "document": "📎 Document",
+        "document": "📎 Doc",
         "audio": "🎵 Audio",
         "voice": "🎤 Voice",
+        "video_note": "📹 Video Note",
         "sticker": "🎨 Sticker",
     }
     MAX_BUTTONS_PER_ROW = 3
 
     def __init__(self, owner_id):
         self.owner_id = owner_id
+
+    @staticmethod
+    def _ce(emoji_id, fallback):
+        return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+    @classmethod
+    def _info(cls, fallback="📝"):
+        return cls._ce(cls.CE_INFO, fallback)
+
+    @classmethod
+    def _tick(cls, fallback="✅"):
+        return cls._ce(cls.CE_TICK, fallback)
+
+    @classmethod
+    def _x(cls, fallback="❌"):
+        return cls._ce(cls.CE_X, fallback)
 
     def _owner_id_set(self):
         multi = getattr(self, "owner_ids", None)
@@ -43,6 +69,8 @@ class OwnerSetupBuilder:
         if not owner_ids:
             return
 
+        # Fail closed at the handler layer: /setup and its input stream only
+        # match configured owners in private DMs.
         owner_private = filters.ChatType.PRIVATE & filters.User(user_id=list(owner_ids))
         content_filter = (
             filters.TEXT
@@ -52,23 +80,21 @@ class OwnerSetupBuilder:
             | filters.Document.ALL
             | filters.AUDIO
             | filters.VOICE
+            | filters.VIDEO_NOTE
             | filters.Sticker.ALL
         )
 
-        # Fail closed at routing level. Non-owners do not match /setup or /cancel.
         app.add_handler(CommandHandler("setup", self.start, filters=owner_private))
         app.add_handler(CommandHandler("cancel", self.cancel, filters=owner_private))
         app.add_handler(CallbackQueryHandler(self.callback, pattern=r"^setup_"))
-        app.add_handler(
-            MessageHandler(owner_private & ~filters.COMMAND & content_filter, self.input)
-        )
+        app.add_handler(MessageHandler(owner_private & ~filters.COMMAND & content_filter, self.input))
 
     async def install_owner_menu(self, app):
-        # Only owner-chat scopes receive /setup. No public/default command scope.
+        # /setup is exposed only in each configured owner's private command scope.
         for owner_id in self._owner_id_set():
             try:
                 await app.bot.set_my_commands(
-                    [BotCommand("setup", "Owner message builder")],
+                    [BotCommand("setup", "Crypto News message builder")],
                     scope=BotCommandScopeChat(chat_id=owner_id),
                 )
             except TelegramError:
@@ -98,7 +124,7 @@ class OwnerSetupBuilder:
         if url is not None:
             kwargs["url"] = url
 
-        # PTB 21.6 predates these Bot API fields, so forward them directly.
+        # PTB 21.6 predates these Bot API fields, so pass them through raw.
         api_kwargs = {}
         if style:
             api_kwargs["style"] = style
@@ -106,7 +132,6 @@ class OwnerSetupBuilder:
             api_kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
         if api_kwargs:
             kwargs["api_kwargs"] = api_kwargs
-
         return InlineKeyboardButton(**kwargs)
 
     def _draft(self, context):
@@ -118,7 +143,8 @@ class OwnerSetupBuilder:
             "step": "content",
             "chat_id": chat_id,
             "html": "",
-            "plain_text": "",
+            "text": "",
+            "entities": [],
             "media": None,
             "media_type": None,
             "buttons": [],
@@ -128,25 +154,34 @@ class OwnerSetupBuilder:
         }
 
     @staticmethod
-    def _html(msg):
-        # PTB converts all Telegram message entities to HTML, including
-        # custom_emoji -> <tg-emoji emoji-id="...">...</tg-emoji>.
-        if msg.text:
-            return msg.text_html or ""
-        if msg.caption:
-            return msg.caption_html or ""
-        return ""
+    def _message_text_and_entities(msg):
+        if msg.text is not None:
+            return msg.text or "", list(msg.entities or ()), msg.text_html or ""
+        if msg.caption is not None:
+            return msg.caption or "", list(msg.caption_entities or ()), msg.caption_html or ""
+        return "", [], ""
 
     @staticmethod
-    def _custom_emoji_id(msg):
-        entities = msg.entities if msg.text else msg.caption_entities
+    def _first_custom_emoji_entity(msg):
+        entities = msg.entities if msg.text is not None else msg.caption_entities
         for entity in entities or ():
             entity_type = str(getattr(entity, "type", "")).lower()
-            if entity_type.endswith("custom_emoji"):
-                custom_id = getattr(entity, "custom_emoji_id", None)
-                if custom_id:
-                    return str(custom_id)
+            if entity_type.endswith("custom_emoji") and getattr(entity, "custom_emoji_id", None):
+                return entity
         return None
+
+    @staticmethod
+    def _remove_utf16_entity(text, entity):
+        """Remove one Telegram entity using Telegram's UTF-16 offsets."""
+        if not text or entity is None:
+            return text
+        try:
+            raw = text.encode("utf-16-le")
+            start = int(entity.offset) * 2
+            end = (int(entity.offset) + int(entity.length)) * 2
+            return (raw[:start] + raw[end:]).decode("utf-16-le").strip()
+        except (AttributeError, ValueError, UnicodeError):
+            return text.strip()
 
     @staticmethod
     def _capture_media(msg, draft):
@@ -162,6 +197,8 @@ class OwnerSetupBuilder:
             draft["media"], draft["media_type"] = msg.audio.file_id, "audio"
         elif msg.voice:
             draft["media"], draft["media_type"] = msg.voice.file_id, "voice"
+        elif msg.video_note:
+            draft["media"], draft["media_type"] = msg.video_note.file_id, "video_note"
         elif msg.sticker:
             draft["media"], draft["media_type"] = msg.sticker.file_id, "sticker"
         else:
@@ -186,8 +223,6 @@ class OwnerSetupBuilder:
             return {"url": "https://" + value}
         if value.startswith("@") and len(value) > 1:
             return {"url": "https://t.me/" + value[1:]}
-
-        # Match Wabble's URL/action input: non-URL action names become callback_data.
         if len(value.encode("utf-8")) <= 64 and "\n" not in value:
             return {"callback_data": value}
         return None
@@ -233,8 +268,29 @@ class OwnerSetupBuilder:
         draft["step"] = "preview"
         return item
 
+    @staticmethod
+    def _strip_tg_emoji_tags(html):
+        return re.sub(r'<tg-emoji\s+emoji-id="[^"]+">(.*?)</tg-emoji>', r"\1", html)
+
+    async def _send_ui_html(self, sender, *args, text=None, **kwargs):
+        """Send UI HTML with animated emoji, falling back to plain emoji if needed."""
+        payload = dict(kwargs)
+        payload["parse_mode"] = ParseMode.HTML
+        try:
+            if text is None:
+                return await sender(*args, **payload)
+            return await sender(*args, text, **payload)
+        except BadRequest as exc:
+            lowered = str(exc).lower()
+            if "custom emoji" not in lowered and "tg-emoji" not in lowered:
+                raise
+            fallback_text = self._strip_tg_emoji_tags(text or "")
+            if text is None:
+                return await sender(*args, **payload)
+            return await sender(*args, fallback_text, **payload)
+
     def _preview_text(self, draft):
-        text = "🔥 <b>Setup — Preview</b>\n\n"
+        text = f"{self._info('📝')} <b>Crypto News — Preview</b>\n\n"
         if draft["media"]:
             text += f"<b>Media:</b> {self.MEDIA_LABELS.get(draft['media_type'], draft['media_type'])}\n"
         if draft["html"]:
@@ -307,36 +363,60 @@ class OwnerSetupBuilder:
             except BadRequest as exc:
                 if "message is not modified" in str(exc).lower():
                     return
+                if "custom emoji" in str(exc).lower() or "tg-emoji" in str(exc).lower():
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=draft["chat_id"],
+                            message_id=old_id,
+                            text=self._strip_tg_emoji_tags(text),
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=keyboard,
+                            disable_web_page_preview=True,
+                        )
+                        return
+                    except TelegramError:
+                        pass
             except TelegramError:
                 pass
             draft["preview_message_id"] = None
 
-        sent = await context.bot.send_message(
-            draft["chat_id"],
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
+        try:
+            sent = await context.bot.send_message(
+                draft["chat_id"],
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        except BadRequest as exc:
+            if "custom emoji" not in str(exc).lower() and "tg-emoji" not in str(exc).lower():
+                raise
+            sent = await context.bot.send_message(
+                draft["chat_id"],
+                self._strip_tg_emoji_tags(text),
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
         draft["preview_message_id"] = sent.message_id
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._owner_private(update):
             return
         context.user_data[self.KEY] = self._new(update.effective_chat.id)
-        await update.effective_message.reply_text(
-            "🔥 <b>Setup</b>\n\n"
+        text = (
+            f"{self._info('📝')} <b>Crypto News</b>\n\n"
             "Send me the content — text, photo, video, or all at once.\n"
-            "<i>Formatting and Telegram custom/animated emojis are preserved.</i>\n"
-            "<i>/cancel to abort</i>",
-            parse_mode=ParseMode.HTML,
+            "<i>/cancel to abort</i>"
         )
+        await self._send_ui_html(update.effective_message.reply_text, text=text)
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._owner_private(update):
             return
         if context.user_data.pop(self.KEY, None) is not None:
-            await update.effective_message.reply_text("❌ <b>Setup cancelled.</b>", parse_mode=ParseMode.HTML)
+            text = f"{self._x('❌')} <b>Crypto News setup cancelled.</b>"
+            await self._send_ui_html(update.effective_message.reply_text, text=text)
 
     async def input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._owner_private(update):
@@ -346,13 +426,16 @@ class OwnerSetupBuilder:
         if not draft or msg is None:
             return
 
-        text = msg.text or msg.caption or ""
+        text, entities, html = self._message_text_and_entities(msg)
         step = draft.get("step", "content")
 
         if step == "target":
             target = text.strip()
             if not target:
-                await msg.reply_text("Send a numeric chat ID, @username, or <b>me</b>.", parse_mode=ParseMode.HTML)
+                await self._send_ui_html(
+                    msg.reply_text,
+                    text=f"{self._x('❌')} Send a numeric chat ID, @username, or <b>me</b>.",
+                )
                 return
             if target.lower() == "me":
                 target = str(draft["chat_id"])
@@ -360,19 +443,22 @@ class OwnerSetupBuilder:
                 try:
                     target = str((await context.bot.get_chat(target)).id)
                 except TelegramError:
-                    await msg.reply_text(
-                        f"❌ <b>Could not find</b> <code>{escape(target)}</code>.\n"
+                    error = (
+                        f"{self._x('❌')} <b>Could not find</b> <code>{escape(target)}</code>.\n"
                         "<i>Make sure the bot is a member, or use the numeric chat ID.</i>\n"
-                        "<i>Try another target or /cancel.</i>",
-                        parse_mode=ParseMode.HTML,
+                        "<i>Try another target or /cancel.</i>"
                     )
+                    await self._send_ui_html(msg.reply_text, text=error)
                     return
             await self._send(target, context)
             return
 
         if step == "media":
             if not self._capture_media(msg, draft):
-                await msg.reply_text("❌ Send a photo, video, GIF, document, audio, voice, or sticker.")
+                await self._send_ui_html(
+                    msg.reply_text,
+                    text=f"{self._x('❌')} Send a photo, video, GIF, document, audio, voice, video note, or sticker.",
+                )
                 return
             draft["step"] = "preview"
             draft["preview_message_id"] = None
@@ -382,26 +468,33 @@ class OwnerSetupBuilder:
         if step == "button_label":
             label = text.strip()
             if not label:
-                await msg.reply_text("❌ Send a non-empty button label.")
+                await self._send_ui_html(msg.reply_text, text=f"{self._x('❌')} Send a non-empty button label.")
                 return
+
             pending = {"text": label}
-            custom_emoji_id = self._custom_emoji_id(msg)
-            if custom_emoji_id:
-                pending["icon_custom_emoji_id"] = custom_emoji_id
+            custom_entity = self._first_custom_emoji_entity(msg)
+            if custom_entity:
+                pending["icon_custom_emoji_id"] = str(custom_entity.custom_emoji_id)
+                stripped = self._remove_utf16_entity(text, custom_entity)
+                if stripped:
+                    pending["text"] = stripped
+
             draft["pending_button"] = pending
             draft["step"] = "button_action"
-            await msg.reply_text(
-                f'<b>URL/action for "{escape(label)}":</b>\n'
-                "<i>Examples: t.me/channel, https://example.com, or a callback action such as pro14 / setnews / rsialert.</i>",
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
+            prompt = (
+                f'<b>URL/action for "{escape(pending["text"])}":</b>\n'
+                "<i>e.g. t.me/channel, https://example.com, or a callback action name</i>"
             )
+            await self._send_ui_html(msg.reply_text, text=prompt, disable_web_page_preview=True)
             return
 
         if step == "button_action":
             action = self._normalize_button_action(text)
             if not action:
-                await msg.reply_text("❌ Send a valid URL, t.me link, @username, or callback action (max 64 UTF-8 bytes).")
+                await self._send_ui_html(
+                    msg.reply_text,
+                    text=f"{self._x('❌')} Send a valid URL, t.me link, @username, or callback action (max 64 UTF-8 bytes).",
+                )
                 return
             draft["pending_button"].update(action)
             draft["step"] = "button_color"
@@ -414,12 +507,12 @@ class OwnerSetupBuilder:
 
         if step == "content":
             has_media = self._capture_media(msg, draft)
-            html = self._html(msg)
-            if html:
+            if text:
+                draft["text"] = text
+                draft["entities"] = entities
                 draft["html"] = html
-                draft["plain_text"] = text
-            if not html and not has_media:
-                await msg.reply_text("❌ Send text, media, or both.")
+            if not text and not has_media:
+                await self._send_ui_html(msg.reply_text, text=f"{self._x('❌')} Send text, media, or both.")
                 return
             draft["step"] = "preview"
             await self._preview(context)
@@ -427,8 +520,7 @@ class OwnerSetupBuilder:
     async def _label_prompt(self, context, chat_id):
         await context.bot.send_message(
             chat_id,
-            "<b>Button label:</b> What text should the button show?\n"
-            "<i>Custom/animated emoji in the label is preserved as the button icon.</i>",
+            "<b>Button label:</b> What text should the button show?",
             parse_mode=ParseMode.HTML,
         )
 
@@ -439,7 +531,12 @@ class OwnerSetupBuilder:
             self._button("🔵 Blue", callback_data="setup_btncolor:primary"),
             self._button("⬜ None", callback_data="setup_btncolor:none"),
         ]])
-        await context.bot.send_message(chat_id, "<b>Button color</b>", parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await context.bot.send_message(
+            chat_id,
+            "<b>Button color</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
 
     async def callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -454,7 +551,10 @@ class OwnerSetupBuilder:
             context.user_data.pop(self.KEY, None)
             await query.answer("Cancelled")
             try:
-                await query.edit_message_text("❌ <b>Setup cancelled.</b>", parse_mode=ParseMode.HTML)
+                await query.edit_message_text(
+                    f"{self._x('❌')} <b>Crypto News setup cancelled.</b>",
+                    parse_mode=ParseMode.HTML,
+                )
             except TelegramError:
                 pass
             return
@@ -490,7 +590,7 @@ class OwnerSetupBuilder:
             action = "replace the current" if draft["media"] else "add"
             await context.bot.send_message(
                 chat_id,
-                "<b>Send media:</b> photo, video, GIF, document, audio, voice, or sticker.\n"
+                "<b>Send media:</b> photo, video, GIF, document, audio, voice, video note, or sticker.\n"
                 f"<i>This will {action} media.</i>",
                 parse_mode=ParseMode.HTML,
             )
@@ -523,11 +623,11 @@ class OwnerSetupBuilder:
             except TelegramError:
                 pass
             await self._preview(context)
-            await context.bot.send_message(
-                chat_id,
-                f'✅ <b>{escape(item["text"])}</b> added!\nTap <b>➕ Buttons</b> to add another.',
-                parse_mode=ParseMode.HTML,
+            added = (
+                f'{self._tick("✅")} <b>{escape(item["text"])}</b> added!\n'
+                "Tap <b>➕ Buttons</b> to add another."
             )
+            await self._send_ui_html(context.bot.send_message, chat_id, text=added)
             return
 
         if data == "setup_clearbtn":
@@ -575,20 +675,29 @@ class OwnerSetupBuilder:
 
         await query.answer()
 
+    async def _send_text_with_entities(self, target, text, entities, keyboard=None):
+        kwargs = {"disable_web_page_preview": True}
+        if entities:
+            kwargs["entities"] = entities
+        if keyboard:
+            kwargs["reply_markup"] = keyboard
+        return await target(text=text, **kwargs)
+
     async def _send(self, target, context: ContextTypes.DEFAULT_TYPE):
         draft = self._draft(context)
         if not draft:
             return
 
         keyboard = self._message_keyboard(draft)
-        html = draft["html"] or ""
-        common = {"parse_mode": ParseMode.HTML}
-        if keyboard:
-            common["reply_markup"] = keyboard
+        text = draft.get("text") or ""
+        entities = list(draft.get("entities") or ())
 
         try:
             media, kind = draft["media"], draft["media_type"]
-            if media and kind != "sticker":
+
+            # Caption-capable media: send the original Telegram entities
+            # natively so formatting and custom/animated emoji IDs survive.
+            if media and kind in {"photo", "video", "animation", "document", "audio", "voice"}:
                 sender = {
                     "photo": context.bot.send_photo,
                     "video": context.bot.send_video,
@@ -596,36 +705,65 @@ class OwnerSetupBuilder:
                     "document": context.bot.send_document,
                     "audio": context.bot.send_audio,
                     "voice": context.bot.send_voice,
-                }.get(kind)
-                if sender:
-                    await sender(target, media, caption=html or None, **common)
+                }[kind]
+
+                # Telegram captions are shorter than normal messages. If the
+                # composed text is too long, keep the media and send the exact
+                # formatted text separately instead of dropping it.
+                if text and len(text) <= 1024:
+                    kwargs = {"caption": text}
+                    if entities:
+                        kwargs["caption_entities"] = entities
+                    if keyboard:
+                        kwargs["reply_markup"] = keyboard
+                    await sender(target, media, **kwargs)
                 else:
-                    await context.bot.send_message(target, html or "Message", disable_web_page_preview=True, **common)
+                    await sender(target, media)
+                    if text or keyboard:
+                        kwargs = {"text": text or "\u2063", "disable_web_page_preview": True}
+                        if entities and text:
+                            kwargs["entities"] = entities
+                        if keyboard:
+                            kwargs["reply_markup"] = keyboard
+                        await context.bot.send_message(target, **kwargs)
+
+            # Video notes and stickers do not carry a normal caption. Send the
+            # media first, then the exact formatted text/buttons when present.
+            elif media and kind == "video_note":
+                if not text and keyboard:
+                    await context.bot.send_video_note(target, media, reply_markup=keyboard)
+                else:
+                    await context.bot.send_video_note(target, media)
+                    if text or keyboard:
+                        kwargs = {"text": text or "\u2063", "disable_web_page_preview": True}
+                        if entities and text:
+                            kwargs["entities"] = entities
+                        if keyboard:
+                            kwargs["reply_markup"] = keyboard
+                        await context.bot.send_message(target, **kwargs)
+
             elif media and kind == "sticker":
                 await context.bot.send_sticker(target, media)
-                if html or keyboard:
-                    await context.bot.send_message(
-                        target,
-                        html or "\u2063",
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=keyboard,
-                        disable_web_page_preview=True,
-                    )
-            else:
-                await context.bot.send_message(
-                    target,
-                    html,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard,
-                    disable_web_page_preview=True,
-                )
+                if text or keyboard:
+                    kwargs = {"text": text or "\u2063", "disable_web_page_preview": True}
+                    if entities and text:
+                        kwargs["entities"] = entities
+                    if keyboard:
+                        kwargs["reply_markup"] = keyboard
+                    await context.bot.send_message(target, **kwargs)
 
-            await context.bot.send_message(
-                draft["chat_id"],
-                f"✅ <b>Sent to</b> <code>{escape(str(target))}</code>",
-                parse_mode=ParseMode.HTML,
-            )
+            else:
+                kwargs = {"text": text, "disable_web_page_preview": True}
+                if entities:
+                    kwargs["entities"] = entities
+                if keyboard:
+                    kwargs["reply_markup"] = keyboard
+                await context.bot.send_message(target, **kwargs)
+
+            success = f"{self._tick('✅')} <b>Sent to</b> <code>{escape(str(target))}</code>"
+            await self._send_ui_html(context.bot.send_message, draft["chat_id"], text=success)
             context.user_data.pop(self.KEY, None)
+
         except (Forbidden, BadRequest, TelegramError) as exc:
             draft["step"] = "target"
             error_text = str(exc)
@@ -635,8 +773,8 @@ class OwnerSetupBuilder:
                 hint = "\n<i>Make sure the bot is a member of the target chat; numeric chat ID is safest.</i>"
             elif "blocked" in lowered:
                 hint = "\n<i>The target user blocked the bot.</i>"
-            await context.bot.send_message(
-                draft["chat_id"],
-                f"❌ <b>Failed:</b> {escape(error_text)}{hint}\n\n<i>Try another target or /cancel.</i>",
-                parse_mode=ParseMode.HTML,
+            failed = (
+                f"{self._x('❌')} <b>Failed:</b> {escape(error_text)}{hint}\n\n"
+                "<i>Try another target or /cancel.</i>"
             )
+            await self._send_ui_html(context.bot.send_message, draft["chat_id"], text=failed)
