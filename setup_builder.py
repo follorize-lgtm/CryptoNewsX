@@ -1,13 +1,19 @@
 from html import escape
 
-from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 
 class OwnerSetupBuilder:
-    """Owner-only Telegram message builder modeled after Wabble's /misucreate."""
+    """Owner-only Telegram message builder matching Wabble's /misucreate UX."""
 
     KEY = "setup_draft"
     MEDIA_LABELS = {
@@ -19,63 +25,88 @@ class OwnerSetupBuilder:
         "voice": "🎤 Voice",
         "sticker": "🎨 Sticker",
     }
+    MAX_BUTTONS_PER_ROW = 3
 
     def __init__(self, owner_id):
         self.owner_id = owner_id
 
+    def _owner_id_set(self):
+        multi = getattr(self, "owner_ids", None)
+        if multi is not None:
+            return {int(owner_id) for owner_id in multi}
+        if self.owner_id is None:
+            return set()
+        return {int(self.owner_id)}
+
     def register(self, app):
-        app.add_handler(CommandHandler("setup", self.start))
-        app.add_handler(CommandHandler("cancel", self.cancel))
+        owner_ids = self._owner_id_set()
+        if not owner_ids:
+            return
+
+        owner_private = filters.ChatType.PRIVATE & filters.User(user_id=list(owner_ids))
+        content_filter = (
+            filters.TEXT
+            | filters.PHOTO
+            | filters.VIDEO
+            | filters.ANIMATION
+            | filters.Document.ALL
+            | filters.AUDIO
+            | filters.VOICE
+            | filters.Sticker.ALL
+        )
+
+        # Fail closed at routing level. Non-owners do not match /setup or /cancel.
+        app.add_handler(CommandHandler("setup", self.start, filters=owner_private))
+        app.add_handler(CommandHandler("cancel", self.cancel, filters=owner_private))
         app.add_handler(CallbackQueryHandler(self.callback, pattern=r"^setup_"))
         app.add_handler(
-            MessageHandler(
-                filters.ChatType.PRIVATE
-                & ~filters.COMMAND
-                & (
-                    filters.TEXT
-                    | filters.PHOTO
-                    | filters.VIDEO
-                    | filters.ANIMATION
-                    | filters.Document.ALL
-                    | filters.AUDIO
-                    | filters.VOICE
-                    | filters.Sticker.ALL
-                ),
-                self.input,
-            )
+            MessageHandler(owner_private & ~filters.COMMAND & content_filter, self.input)
         )
 
     async def install_owner_menu(self, app):
-        if self.owner_id is None:
-            return
-        try:
-            await app.bot.set_my_commands(
-                [BotCommand("setup", "Owner message builder")],
-                scope=BotCommandScopeChat(chat_id=self.owner_id),
-            )
-        except TelegramError:
-            pass
+        # Only owner-chat scopes receive /setup. No public/default command scope.
+        for owner_id in self._owner_id_set():
+            try:
+                await app.bot.set_my_commands(
+                    [BotCommand("setup", "Owner message builder")],
+                    scope=BotCommandScopeChat(chat_id=owner_id),
+                )
+            except TelegramError:
+                pass
 
     def _owner_private(self, update):
         user, chat = update.effective_user, update.effective_chat
         return bool(
-            self.owner_id is not None
-            and user
+            user
             and chat
-            and user.id == self.owner_id
+            and user.id in self._owner_id_set()
             and chat.type == ChatType.PRIVATE
         )
 
     @staticmethod
-    def _button(text, *, callback_data=None, url=None, style=None):
+    def _button(
+        text,
+        *,
+        callback_data=None,
+        url=None,
+        style=None,
+        icon_custom_emoji_id=None,
+    ):
         kwargs = {"text": text}
         if callback_data is not None:
             kwargs["callback_data"] = callback_data
         if url is not None:
             kwargs["url"] = url
+
+        # PTB 21.6 predates these Bot API fields, so forward them directly.
+        api_kwargs = {}
         if style:
-            # Forward modern Bot API button styling while keeping PTB 21.6.
-            kwargs["api_kwargs"] = {"style": style}
+            api_kwargs["style"] = style
+        if icon_custom_emoji_id:
+            api_kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
+        if api_kwargs:
+            kwargs["api_kwargs"] = api_kwargs
+
         return InlineKeyboardButton(**kwargs)
 
     def _draft(self, context):
@@ -87,21 +118,35 @@ class OwnerSetupBuilder:
             "step": "content",
             "chat_id": chat_id,
             "html": "",
+            "plain_text": "",
             "media": None,
             "media_type": None,
             "buttons": [],
-            "button_row": 0,
             "pending_button": None,
+            "force_new_row": False,
             "preview_message_id": None,
         }
 
     @staticmethod
     def _html(msg):
+        # PTB converts all Telegram message entities to HTML, including
+        # custom_emoji -> <tg-emoji emoji-id="...">...</tg-emoji>.
         if msg.text:
             return msg.text_html or ""
         if msg.caption:
             return msg.caption_html or ""
         return ""
+
+    @staticmethod
+    def _custom_emoji_id(msg):
+        entities = msg.entities if msg.text else msg.caption_entities
+        for entity in entities or ():
+            entity_type = str(getattr(entity, "type", "")).lower()
+            if entity_type.endswith("custom_emoji"):
+                custom_id = getattr(entity, "custom_emoji_id", None)
+                if custom_id:
+                    return str(custom_id)
+        return None
 
     @staticmethod
     def _capture_media(msg, draft):
@@ -127,70 +172,116 @@ class OwnerSetupBuilder:
     def _rows(draft):
         return [row for row in draft["buttons"] if row]
 
-    def _url_keyboard(self, draft):
+    @staticmethod
+    def _normalize_button_action(raw):
+        value = raw.strip()
+        if not value:
+            return None
+        lowered = value.lower()
+        if lowered.startswith(("https://", "http://", "tg://")):
+            return {"url": value}
+        if lowered.startswith("t.me/"):
+            return {"url": "https://" + value}
+        if lowered.startswith("www."):
+            return {"url": "https://" + value}
+        if value.startswith("@") and len(value) > 1:
+            return {"url": "https://t.me/" + value[1:]}
+
+        # Match Wabble's URL/action input: non-URL action names become callback_data.
+        if len(value.encode("utf-8")) <= 64 and "\n" not in value:
+            return {"callback_data": value}
+        return None
+
+    def _message_keyboard(self, draft):
         rows = []
         for row in self._rows(draft):
-            rows.append([
-                self._button(item["text"], url=item["url"], style=item.get("style"))
-                for item in row
-            ])
+            built = []
+            for item in row:
+                built.append(
+                    self._button(
+                        item["text"],
+                        url=item.get("url"),
+                        callback_data=item.get("callback_data"),
+                        style=item.get("style"),
+                        icon_custom_emoji_id=item.get("icon_custom_emoji_id"),
+                    )
+                )
+            if built:
+                rows.append(built)
         return InlineKeyboardMarkup(rows) if rows else None
 
-    @staticmethod
-    def _ensure_row(draft):
-        idx = int(draft.get("button_row", 0))
-        while len(draft["buttons"]) <= idx:
-            draft["buttons"].append([])
-        return draft["buttons"][idx]
+    def _add_pending_button(self, draft, style):
+        item = dict(draft.get("pending_button") or {})
+        if not item.get("text"):
+            return None
+        if style != "none":
+            item["style"] = style
+
+        rows = draft["buttons"]
+        if (
+            not draft.get("force_new_row")
+            and rows
+            and rows[-1]
+            and len(rows[-1]) < self.MAX_BUTTONS_PER_ROW
+        ):
+            rows[-1].append(item)
+        else:
+            rows.append([item])
+
+        draft["pending_button"] = None
+        draft["force_new_row"] = False
+        draft["step"] = "preview"
+        return item
 
     def _preview_text(self, draft):
-        parts = ["📝 <b>Setup — Preview</b>"]
+        text = "🔥 <b>Setup — Preview</b>\n\n"
         if draft["media"]:
-            parts.append(f"<b>Media:</b> {self.MEDIA_LABELS.get(draft['media_type'], draft['media_type'])}")
+            text += f"<b>Media:</b> {self.MEDIA_LABELS.get(draft['media_type'], draft['media_type'])}\n"
         if draft["html"]:
-            parts.append(f"<b>Text:</b>\n{draft['html']}")
+            text += f"<b>Text:</b>\n{draft['html']}\n"
+
         rows = self._rows(draft)
         if rows:
-            lines = ["<b>Buttons:</b>"]
-            for i, row in enumerate(rows, 1):
+            text += "\n<b>Buttons:</b>\n"
+            for index, row in enumerate(rows, 1):
                 style = row[0].get("style") if row else None
-                icon = {"success": "🟢", "danger": "🔴", "primary": "🔵"}.get(style, "⬜")
-                lines.append(f"{i}. {' | '.join(escape(x['text']) for x in row)} {icon}")
-            parts.append("\n".join(lines))
-        return "\n\n".join(parts)
+                style_icon = {"success": "🟢", "danger": "🔴", "primary": "🔵"}.get(style, "⬜")
+                labels = " | ".join(escape(item["text"]) for item in row)
+                text += f"  {index}. {labels} [{style_icon}]\n"
+        return text.rstrip()
 
     def _preview_keyboard(self, draft):
-        media = "📎 Change Media" if draft["media"] else "📎 Attach Media"
+        media_label = "📎 Change Media" if draft["media"] else "📎 Attach Media"
         rows = [[
             self._button("📤 Send to Me", callback_data="setup_sendme", style="success"),
             self._button("📤 Send to Chat", callback_data="setup_send", style="primary"),
         ]]
+
         button_rows = self._rows(draft)
         if button_rows:
-            rows += [
-                [
-                    self._button("➕ Button", callback_data="setup_addbtn"),
-                    self._button("↩ New Row", callback_data="setup_newrow"),
-                    self._button(media, callback_data="setup_media"),
-                ],
-                [
-                    self._button("🗑 Clear", callback_data="setup_clearbtn"),
-                    self._button("❌ Cancel", callback_data="setup_cancel", style="danger"),
-                ],
-            ]
-            for i in range(len(button_rows)):
-                rows.append([
-                    self._button(f"{i + 1}: 🔴", callback_data=f"setup_rstyle:{i}:danger"),
-                    self._button("🟢", callback_data=f"setup_rstyle:{i}:success"),
-                    self._button("🔵", callback_data=f"setup_rstyle:{i}:primary"),
-                    self._button("⬜", callback_data=f"setup_rstyle:{i}:none"),
-                    self._button("🗑", callback_data=f"setup_remrow:{i}"),
-                ])
+            rows.append([
+                self._button("➕ Button", callback_data="setup_addbtn"),
+                self._button("↩ New Row", callback_data="setup_newrow"),
+                self._button(media_label, callback_data="setup_media"),
+            ])
+            rows.append([
+                self._button("🗑 Clear", callback_data="setup_clearbtn"),
+                self._button("❌", callback_data="setup_cancel", style="danger"),
+            ])
         else:
             rows.append([
                 self._button("➕ Buttons", callback_data="setup_addbtn"),
-                self._button(media, callback_data="setup_media"),
-                self._button("❌ Cancel", callback_data="setup_cancel", style="danger"),
+                self._button(media_label, callback_data="setup_media"),
+                self._button("❌", callback_data="setup_cancel", style="danger"),
+            ])
+
+        for index in range(len(button_rows)):
+            rows.append([
+                self._button(f"{index + 1}: 🔴", callback_data=f"setup_rstyle:{index}:danger"),
+                self._button("🟢", callback_data=f"setup_rstyle:{index}:success"),
+                self._button("🔵", callback_data=f"setup_rstyle:{index}:primary"),
+                self._button("⬜", callback_data=f"setup_rstyle:{index}:none"),
+                self._button("🗑", callback_data=f"setup_remrow:{index}"),
             ])
         return InlineKeyboardMarkup(rows)
 
@@ -198,8 +289,10 @@ class OwnerSetupBuilder:
         draft = self._draft(context)
         if not draft:
             return
-        text, keyboard = self._preview_text(draft), self._preview_keyboard(draft)
+        text = self._preview_text(draft)
+        keyboard = self._preview_keyboard(draft)
         old_id = draft.get("preview_message_id")
+
         if old_id:
             try:
                 await context.bot.edit_message_text(
@@ -217,8 +310,10 @@ class OwnerSetupBuilder:
             except TelegramError:
                 pass
             draft["preview_message_id"] = None
+
         sent = await context.bot.send_message(
-            draft["chat_id"], text,
+            draft["chat_id"],
+            text,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
             disable_web_page_preview=True,
@@ -230,8 +325,9 @@ class OwnerSetupBuilder:
             return
         context.user_data[self.KEY] = self._new(update.effective_chat.id)
         await update.effective_message.reply_text(
-            "📝 <b>Setup</b>\n\n"
-            "Send the content — text, photo, video, GIF, document, audio, voice, sticker, or text + media together.\n\n"
+            "🔥 <b>Setup</b>\n\n"
+            "Send me the content — text, photo, video, or all at once.\n"
+            "<i>Formatting and Telegram custom/animated emojis are preserved.</i>\n"
             "<i>/cancel to abort</i>",
             parse_mode=ParseMode.HTML,
         )
@@ -245,9 +341,11 @@ class OwnerSetupBuilder:
     async def input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._owner_private(update):
             return
-        draft, msg = self._draft(context), update.effective_message
+        draft = self._draft(context)
+        msg = update.effective_message
         if not draft or msg is None:
             return
+
         text = msg.text or msg.caption or ""
         step = draft.get("step", "content")
 
@@ -264,7 +362,8 @@ class OwnerSetupBuilder:
                 except TelegramError:
                     await msg.reply_text(
                         f"❌ <b>Could not find</b> <code>{escape(target)}</code>.\n"
-                        "<i>Make sure the bot is a member, or use the numeric chat ID. Try another target or /cancel.</i>",
+                        "<i>Make sure the bot is a member, or use the numeric chat ID.</i>\n"
+                        "<i>Try another target or /cancel.</i>",
                         parse_mode=ParseMode.HTML,
                     )
                     return
@@ -285,20 +384,26 @@ class OwnerSetupBuilder:
             if not label:
                 await msg.reply_text("❌ Send a non-empty button label.")
                 return
-            draft["pending_button"] = {"text": label}
-            draft["step"] = "button_url"
+            pending = {"text": label}
+            custom_emoji_id = self._custom_emoji_id(msg)
+            if custom_emoji_id:
+                pending["icon_custom_emoji_id"] = custom_emoji_id
+            draft["pending_button"] = pending
+            draft["step"] = "button_action"
             await msg.reply_text(
-                "<b>Button URL</b>\n\nSend an <code>https://</code> or <code>http://</code> link.",
+                f'<b>URL/action for "{escape(label)}":</b>\n'
+                "<i>Examples: t.me/channel, https://example.com, or a callback action such as pro14 / setnews / rsialert.</i>",
                 parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
             )
             return
 
-        if step == "button_url":
-            url = text.strip()
-            if not url.startswith(("https://", "http://")):
-                await msg.reply_text("❌ URL must start with <code>https://</code> or <code>http://</code>.", parse_mode=ParseMode.HTML)
+        if step == "button_action":
+            action = self._normalize_button_action(text)
+            if not action:
+                await msg.reply_text("❌ Send a valid URL, t.me link, @username, or callback action (max 64 UTF-8 bytes).")
                 return
-            draft["pending_button"]["url"] = url
+            draft["pending_button"].update(action)
             draft["step"] = "button_color"
             await self._color_prompt(context, draft["chat_id"])
             return
@@ -312,6 +417,7 @@ class OwnerSetupBuilder:
             html = self._html(msg)
             if html:
                 draft["html"] = html
+                draft["plain_text"] = text
             if not html and not has_media:
                 await msg.reply_text("❌ Send text, media, or both.")
                 return
@@ -320,7 +426,10 @@ class OwnerSetupBuilder:
 
     async def _label_prompt(self, context, chat_id):
         await context.bot.send_message(
-            chat_id, "<b>Button label</b>\n\nSend the text shown on the button.", parse_mode=ParseMode.HTML
+            chat_id,
+            "<b>Button label:</b> What text should the button show?\n"
+            "<i>Custom/animated emoji in the label is preserved as the button icon.</i>",
+            parse_mode=ParseMode.HTML,
         )
 
     async def _color_prompt(self, context, chat_id):
@@ -339,8 +448,8 @@ class OwnerSetupBuilder:
         if not self._owner_private(update):
             await query.answer("Owner only.", show_alert=True)
             return
-        data = query.data or ""
 
+        data = query.data or ""
         if data == "setup_cancel":
             context.user_data.pop(self.KEY, None)
             await query.answer("Cancelled")
@@ -360,55 +469,76 @@ class OwnerSetupBuilder:
             await query.answer("Sending to you...")
             await self._send(str(chat_id), context)
             return
+
         if data == "setup_send":
-            draft["step"], draft["pending_button"] = "target", None
+            draft["step"] = "target"
+            draft["pending_button"] = None
             await query.answer()
             await context.bot.send_message(
                 chat_id,
-                "<b>Where to send?</b>\n\nEnter a numeric chat ID or @username. Type <code>me</code> to send to yourself.",
+                "<b>Where to send?</b>\n\n"
+                "<i>Enter a chat ID (e.g. -1001234567890) or @username.</i>\n"
+                "<i>Type</i> <code>me</code> <i>to send to yourself.</i>",
                 parse_mode=ParseMode.HTML,
             )
             return
+
         if data == "setup_media":
-            draft["step"], draft["pending_button"] = "media", None
+            draft["step"] = "media"
+            draft["pending_button"] = None
             await query.answer()
             action = "replace the current" if draft["media"] else "add"
             await context.bot.send_message(
                 chat_id,
-                f"<b>Send media:</b> photo, video, GIF, document, audio, voice, or sticker.\n<i>This will {action} media.</i>",
+                "<b>Send media:</b> photo, video, GIF, document, audio, voice, or sticker.\n"
+                f"<i>This will {action} media.</i>",
                 parse_mode=ParseMode.HTML,
             )
             return
+
         if data in {"setup_addbtn", "setup_newrow"}:
-            if data == "setup_newrow" or not draft["buttons"]:
-                if not draft["buttons"] or draft["buttons"][-1]:
-                    draft["buttons"].append([])
-                draft["button_row"] = len(draft["buttons"]) - 1
-            else:
-                draft["button_row"] = min(draft.get("button_row", 0), len(draft["buttons"]) - 1)
-            draft["pending_button"], draft["step"] = None, "button_label"
-            await query.answer("New row" if data == "setup_newrow" else None)
+            draft["force_new_row"] = data == "setup_newrow"
+            draft["pending_button"] = None
+            draft["step"] = "button_label"
+            await query.answer("New row — enter label" if data == "setup_newrow" else None)
             await self._label_prompt(context, chat_id)
             return
+
         if data.startswith("setup_btncolor:"):
             style = data.split(":", 1)[1]
-            pending = draft.get("pending_button") or {}
-            if draft.get("step") != "button_color" or not pending.get("url"):
+            if draft.get("step") != "button_color" or not draft.get("pending_button"):
                 await query.answer("No button waiting for a color.", show_alert=True)
                 return
-            item = dict(pending)
-            if style != "none":
-                item["style"] = style
-            self._ensure_row(draft).append(item)
-            draft["pending_button"], draft["step"] = None, "preview"
-            await query.answer("Button added")
+            item = self._add_pending_button(draft, style)
+            if not item:
+                await query.answer("Button draft is missing.", show_alert=True)
+                return
+            await query.answer(f'Button "{item["text"]}" added!')
+            try:
+                if query.message:
+                    await context.bot.delete_message(
+                        chat_id=query.message.chat_id,
+                        message_id=query.message.message_id,
+                    )
+            except TelegramError:
+                pass
             await self._preview(context)
+            await context.bot.send_message(
+                chat_id,
+                f'✅ <b>{escape(item["text"])}</b> added!\nTap <b>➕ Buttons</b> to add another.',
+                parse_mode=ParseMode.HTML,
+            )
             return
+
         if data == "setup_clearbtn":
-            draft["buttons"], draft["button_row"], draft["pending_button"], draft["step"] = [], 0, None, "preview"
+            draft["buttons"] = []
+            draft["pending_button"] = None
+            draft["force_new_row"] = False
+            draft["step"] = "preview"
             await query.answer("Cleared")
             await self._preview(context)
             return
+
         if data.startswith("setup_rstyle:"):
             try:
                 _, row_text, style = data.split(":", 2)
@@ -425,29 +555,37 @@ class OwnerSetupBuilder:
             await query.answer(f"Row {row_index + 1} updated")
             await self._preview(context)
             return
+
         if data.startswith("setup_remrow:"):
             try:
                 visible_index = int(data.split(":", 1)[1])
-                real_index = [i for i, row in enumerate(draft["buttons"]) if row][visible_index]
+                real_indices = [index for index, row in enumerate(draft["buttons"]) if row]
+                real_index = real_indices[visible_index]
             except (ValueError, IndexError):
                 await query.answer("Row no longer exists.", show_alert=True)
                 return
             del draft["buttons"][real_index]
             draft["buttons"] = self._rows(draft)
-            draft["button_row"] = max(0, len(draft["buttons"]) - 1)
+            draft["pending_button"] = None
+            draft["force_new_row"] = False
+            draft["step"] = "preview"
             await query.answer("Removed")
             await self._preview(context)
             return
+
         await query.answer()
 
     async def _send(self, target, context: ContextTypes.DEFAULT_TYPE):
         draft = self._draft(context)
         if not draft:
             return
-        keyboard, html = self._url_keyboard(draft), draft["html"] or ""
+
+        keyboard = self._message_keyboard(draft)
+        html = draft["html"] or ""
         common = {"parse_mode": ParseMode.HTML}
         if keyboard:
             common["reply_markup"] = keyboard
+
         try:
             media, kind = draft["media"], draft["media_type"]
             if media and kind != "sticker":
@@ -467,16 +605,25 @@ class OwnerSetupBuilder:
                 await context.bot.send_sticker(target, media)
                 if html or keyboard:
                     await context.bot.send_message(
-                        target, html or "\u2063", parse_mode=ParseMode.HTML,
-                        reply_markup=keyboard, disable_web_page_preview=True,
+                        target,
+                        html or "\u2063",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                        disable_web_page_preview=True,
                     )
             else:
                 await context.bot.send_message(
-                    target, html, parse_mode=ParseMode.HTML,
-                    reply_markup=keyboard, disable_web_page_preview=True,
+                    target,
+                    html,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
                 )
+
             await context.bot.send_message(
-                draft["chat_id"], f"✅ <b>Sent to</b> <code>{escape(str(target))}</code>", parse_mode=ParseMode.HTML
+                draft["chat_id"],
+                f"✅ <b>Sent to</b> <code>{escape(str(target))}</code>",
+                parse_mode=ParseMode.HTML,
             )
             context.user_data.pop(self.KEY, None)
         except (Forbidden, BadRequest, TelegramError) as exc:
