@@ -72,6 +72,23 @@ class MultiOwnerSetupBuilder(OwnerSetupBuilder):
             parse_mode=ParseMode.HTML,
         )
 
+    async def callback(self, update, context):
+        query = update.callback_query
+        if query is not None and (query.data or "") == "setup_cancel":
+            if not self._owner_private(update):
+                await query.answer("Owner only.", show_alert=True)
+                return
+            context.user_data.pop(self.KEY, None)
+            await query.answer("Cancelled")
+            try:
+                await query.edit_message_text(
+                    "❌ <b>MisuCreate cancelled.</b>", parse_mode=ParseMode.HTML
+                )
+            except TelegramError:
+                pass
+            return
+        await super().callback(update, context)
+
     async def input(self, update, context):
         # Match Wabble's exact button-label -> URL/action prompt while keeping
         # the base builder's media, formatting, custom-emoji and send logic.
