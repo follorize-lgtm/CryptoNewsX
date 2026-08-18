@@ -13,6 +13,7 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from poster import is_too_long_error, split_thread
 from processor import process
+from setup_builder import OwnerSetupBuilder
 
 load_dotenv()
 
@@ -29,6 +30,12 @@ MAX_HASHTAGS = int(os.getenv("MAX_HASHTAGS", "2"))
 MIN_INTERVAL = int(os.getenv("MIN_INTERVAL_SECONDS", "45"))
 GROUP_WAIT = float(os.getenv("ALBUM_WAIT_SECONDS", "2"))
 THREAD_INTERVAL = float(os.getenv("THREAD_INTERVAL_SECONDS", "2"))
+
+_owner_raw = os.environ.get("OWNER_TELEGRAM_ID", "").strip()
+OWNER_TELEGRAM_ID = int(_owner_raw) if _owner_raw.isdigit() else None
+if OWNER_TELEGRAM_ID is None:
+    log.warning("OWNER_TELEGRAM_ID is not set; owner-only /setup is disabled")
+setup_builder = OwnerSetupBuilder(OWNER_TELEGRAM_ID)
 
 twitter = tweepy.Client(
     consumer_key=os.environ["X_API_KEY"],
@@ -294,11 +301,16 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle([msg])
 
 
+async def post_init(app: Application):
+    await setup_builder.install_owner_menu(app)
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    setup_builder.register(app)
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
     log.info("watching %s", ", ".join(CHANNELS) if CHANNELS else "all channels the bot is in")
-    app.run_polling(allowed_updates=["channel_post"])
+    app.run_polling(allowed_updates=["message", "callback_query", "channel_post"])
 
 
 if __name__ == "__main__":
