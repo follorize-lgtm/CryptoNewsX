@@ -34,11 +34,19 @@ every new channel post to the bot, which cleans the text and posts it to X.
 | Variable | What it is |
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Bot token from BotFather |
+| `OWNER_TELEGRAM_IDS` | Comma-separated numeric Telegram user IDs allowed to use `/setup` in private chat |
+| `OWNER_TELEGRAM_ID` | Backward-compatible single-owner variable; can also be used together with `OWNER_TELEGRAM_IDS` |
 | `SOURCE_CHANNELS` | Comma-separated channel ids or usernames to allow (leave empty to accept every channel the bot is in) |
 | `X_API_KEY` / `X_API_SECRET` | X app consumer keys |
 | `X_ACCESS_TOKEN` / `X_ACCESS_SECRET` | X access token for the posting account (needs Read and Write) |
 | `MAX_HASHTAGS` | Max inline hashtags per post (default 2) |
 | `MIN_INTERVAL_SECONDS` | Minimum gap between posts (default 45) |
+
+Example with multiple `/setup` owners:
+
+    OWNER_TELEGRAM_IDS=123456789,987654321,555555555
+
+Every ID in that list gets the same owner-only `/setup` access, and `/setup` still only works in a private chat with the bot.
 
 To find a channel id, forward a channel post to [@userinfobot](https://t.me/userinfobot)
 or read it from the bot logs. Channel ids look like `-1001234567890`.
