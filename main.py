@@ -11,9 +11,9 @@ from requests_oauthlib import OAuth1
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
+from multi_owner_setup import MultiOwnerSetupBuilder
 from poster import is_too_long_error, split_thread
 from processor import process
-from setup_builder import OwnerSetupBuilder
 
 load_dotenv()
 
@@ -31,11 +31,35 @@ MIN_INTERVAL = int(os.getenv("MIN_INTERVAL_SECONDS", "45"))
 GROUP_WAIT = float(os.getenv("ALBUM_WAIT_SECONDS", "2"))
 THREAD_INTERVAL = float(os.getenv("THREAD_INTERVAL_SECONDS", "2"))
 
-_owner_raw = os.environ.get("OWNER_TELEGRAM_ID", "").strip()
-OWNER_TELEGRAM_ID = int(_owner_raw) if _owner_raw.isdigit() else None
-if OWNER_TELEGRAM_ID is None:
-    log.warning("OWNER_TELEGRAM_ID is not set; owner-only /setup is disabled")
-setup_builder = OwnerSetupBuilder(OWNER_TELEGRAM_ID)
+
+def _parse_owner_ids():
+    raw = ",".join(
+        value
+        for value in (
+            os.environ.get("OWNER_TELEGRAM_ID", ""),
+            os.environ.get("OWNER_TELEGRAM_IDS", ""),
+        )
+        if value.strip()
+    )
+    owner_ids = set()
+    invalid = []
+    for value in raw.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        try:
+            owner_ids.add(int(value))
+        except ValueError:
+            invalid.append(value)
+    if invalid:
+        log.warning("ignoring invalid owner Telegram ID(s): %s", ", ".join(invalid))
+    return owner_ids
+
+
+OWNER_TELEGRAM_IDS = _parse_owner_ids()
+if not OWNER_TELEGRAM_IDS:
+    log.warning("OWNER_TELEGRAM_ID(S) is not set; owner-only /setup is disabled")
+setup_builder = MultiOwnerSetupBuilder(OWNER_TELEGRAM_IDS)
 
 twitter = tweepy.Client(
     consumer_key=os.environ["X_API_KEY"],
