@@ -14,6 +14,7 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from multi_owner_setup import MultiOwnerSetupBuilder
 from poster import is_too_long_error, split_thread
 from processor import process
+import publer_x
 
 load_dotenv()
 
@@ -291,6 +292,16 @@ async def handle(msgs):
         if raw:
             break
     text = process(raw, MAX_HASHTAGS)
+    if os.getenv("X_POST_PROVIDER", "direct").lower() == "publer":
+        if not publer_x.configured():
+            log.error("Publer X is selected but its key, workspace or account mapping is missing")
+            return
+        try:
+            job = await publer_x.publish(msgs, text)
+            log.info("Publer X submission: %s", job)
+        except Exception as exc:
+            log.error("Publer X submission needs review: %s", exc)
+        return
     items = await collect_media(msgs)
     groups = _batch(items)
     if not text and not groups:

@@ -3,5 +3,6 @@
 *.session-journal
 __pycache__/
 *.pyc
+publer-x-state.sqlite3
 venv/
 .venv/
