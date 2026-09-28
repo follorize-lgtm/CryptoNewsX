@@ -4,5 +4,7 @@
 __pycache__/
 *.pyc
 publer-x-state.sqlite3
+*.sqlite3
+*.sqlite3-*
 venv/
 .venv/

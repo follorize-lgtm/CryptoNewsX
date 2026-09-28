@@ -15,6 +15,7 @@ from multi_owner_setup import MultiOwnerSetupBuilder
 from poster import is_too_long_error, split_thread
 from processor import process
 import publer_x
+import schedchie_x
 
 load_dotenv()
 
@@ -62,18 +63,21 @@ if not OWNER_TELEGRAM_IDS:
     log.warning("OWNER_TELEGRAM_ID(S) is not set; owner-only /setup is disabled")
 setup_builder = MultiOwnerSetupBuilder(OWNER_TELEGRAM_IDS)
 
-twitter = tweepy.Client(
-    consumer_key=os.environ["X_API_KEY"],
-    consumer_secret=os.environ["X_API_SECRET"],
-    access_token=os.environ["X_ACCESS_TOKEN"],
-    access_token_secret=os.environ["X_ACCESS_SECRET"],
-)
-_oauth = OAuth1(
-    os.environ["X_API_KEY"],
-    os.environ["X_API_SECRET"],
-    os.environ["X_ACCESS_TOKEN"],
-    os.environ["X_ACCESS_SECRET"],
-)
+if os.getenv('X_POST_PROVIDER', 'direct').lower() == 'direct':
+    twitter = tweepy.Client(
+        consumer_key=os.environ["X_API_KEY"],
+        consumer_secret=os.environ["X_API_SECRET"],
+        access_token=os.environ["X_ACCESS_TOKEN"],
+        access_token_secret=os.environ["X_ACCESS_SECRET"],
+    )
+    _oauth = OAuth1(
+        os.environ["X_API_KEY"],
+        os.environ["X_API_SECRET"],
+        os.environ["X_ACCESS_TOKEN"],
+        os.environ["X_ACCESS_SECRET"],
+    )
+else:
+    twitter = _oauth = None
 MEDIA_URL = "https://api.x.com/2/media/upload"
 
 _last_post = 0.0
@@ -302,6 +306,16 @@ async def handle(msgs):
         except Exception as exc:
             log.error("Publer X submission needs review: %s", exc)
         return
+    if os.getenv('X_POST_PROVIDER', 'direct').lower() == 'schedchie':
+        if not schedchie_x.configured():
+            log.error('Schedchie X is selected but its account, OAuth or media configuration is missing')
+            return
+        try:
+            post_id = await schedchie_x.publish(msgs, text)
+            log.info('Schedchie X submission: %s', post_id)
+        except Exception:
+            log.exception('Schedchie X submission needs review; it will not be retried blindly')
+        return
     items = await collect_media(msgs)
     groups = _batch(items)
     if not text and not groups:
@@ -338,6 +352,15 @@ async def on_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     await setup_builder.install_owner_menu(app)
+    if os.getenv('X_POST_PROVIDER', 'direct').lower() == 'schedchie' and schedchie_x.configured():
+        async def reconcile_forever():
+            while True:
+                try:
+                    await asyncio.to_thread(schedchie_x.reconcile)
+                except Exception:
+                    log.exception('Schedchie X delivery reconciliation failed')
+                await asyncio.sleep(60)
+        app.create_task(reconcile_forever())
 
 
 def main():
