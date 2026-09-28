@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 import logging
 import os
 import tempfile
@@ -360,11 +361,19 @@ async def post_init(app: Application):
                 except Exception:
                     log.exception('Schedchie X delivery reconciliation failed')
                 await asyncio.sleep(60)
-        app.create_task(reconcile_forever())
+        app.bot_data['schedchie_reconcile_task'] = asyncio.create_task(reconcile_forever())
+
+
+async def post_shutdown(app: Application):
+    task = app.bot_data.pop('schedchie_reconcile_task', None)
+    if task:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     setup_builder.register(app)
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, on_channel_post))
     log.info("watching %s", ", ".join(CHANNELS) if CHANNELS else "all channels the bot is in")
