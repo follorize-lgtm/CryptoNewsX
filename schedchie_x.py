@@ -13,9 +13,11 @@ from pathlib import Path
 import requests
 
 from schedchie_client import Client, SchedchieError, tool_json
+from telegram_media import check_downloadable, media_source
 
 
 log = logging.getLogger('crosspost.schedchie')
+MEDIA_ATTEMPTS = 3
 
 
 def configured():
@@ -62,23 +64,41 @@ def _stage(path, extension, mime):
     key = f'wabble/x/tx_01/{digest}.{extension}'
     upload = os.environ['SCHEDCHIE_MEDIA_UPLOAD_URL'].rstrip('/') + '/media/' + key
     public = os.environ['SCHEDCHIE_MEDIA_BASE_URL'].rstrip('/') + '/media/' + key
+    # Keys are content hashes, so a file that is already public is reused.
+    # A relay that refuses overwrites must not block a repeated picture.
+    try:
+        if requests.head(public, timeout=30, allow_redirects=True).status_code == 200:
+            return public
+    except requests.RequestException:
+        pass
     with Path(path).open('rb') as file:
         response = requests.put(upload, data=file, headers={
             'Authorization': 'Bearer ' + os.environ['SCHEDCHIE_MEDIA_UPLOAD_TOKEN'],
             'Content-Type': mime, 'Content-Length': str(Path(path).stat().st_size),
         }, timeout=120)
-    response.raise_for_status()
+    if response.status_code in (409, 412):
+        return public
+    if response.status_code >= 400:
+        raise SchedchieError(f'media relay upload HTTP {response.status_code}: {response.text[:200]}')
     return public
 
 
+def _confirmed_media(reply):
+    for value in (reply, reply.get('media'), reply.get('data'), reply.get('result'),
+                  reply.get('mediaItem')):
+        if isinstance(value, dict) and value.get('gcsObjectName'):
+            return value
+        if isinstance(value, list) and value and isinstance(value[0], dict) and value[0].get('gcsObjectName'):
+            return value[0]
+    return None
+
+
 async def _media_descriptor(message, client):
-    source = message.photo[-1] if message.photo else message.video or message.animation
-    if not source:
+    found = media_source(message)
+    if not found:
         return None
-    if message.photo:
-        extension, mime = 'jpg', 'image/jpeg'
-    else:
-        extension, mime = 'mp4', 'video/mp4'
+    source, extension, mime, _kind = found
+    check_downloadable(source)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / ('telegram.' + extension)
         await (await source.get_file()).download_to_drive(str(path))
@@ -86,11 +106,28 @@ async def _media_descriptor(message, client):
             raise ValueError('Telegram media exceeds the 200 MB relay limit')
         url = await asyncio.to_thread(_stage, path, extension, mime)
     result = await asyncio.to_thread(client.call, 'upload_media', {'url': url, 'mimeType': mime})
-    media = tool_json(result)
-    media = media.get('media', media)
-    if not isinstance(media, dict) or not media.get('gcsObjectName'):
+    media = _confirmed_media(tool_json(result))
+    if not media:
         raise SchedchieError('Schedchie did not confirm the media upload')
     return media
+
+
+async def _media_with_retry(message, client):
+    """Staging and upload_media publish nothing, so they are safe to retry."""
+    for attempt in range(1, MEDIA_ATTEMPTS + 1):
+        try:
+            return await _media_descriptor(message, client)
+        except ValueError as exc:
+            log.error('Schedchie X media skipped for message %s: %s', message.message_id, exc)
+            return None
+        except Exception as exc:
+            if attempt == MEDIA_ATTEMPTS:
+                log.error('Schedchie X media failed for message %s after %d attempts: %s',
+                          message.message_id, attempt, exc)
+                return None
+            log.warning('Schedchie X media attempt %d failed for message %s: %s',
+                        attempt, message.message_id, exc)
+            await asyncio.sleep(2 * attempt)
 
 
 def _source(messages):
@@ -109,20 +146,32 @@ async def publish(messages, text):
         existing = db.execute('SELECT state,post_id FROM submissions WHERE source=?', (source,)).fetchone()
         if existing:
             return existing['post_id'] or 'already-' + existing['state']
-    if not text and not any(m.photo or m.video or m.animation for m in messages):
+    wanted = []
+    for message in messages:
+        found = media_source(message)
+        if not found:
+            continue
+        kind = found[3]
+        if kind == 'video':
+            # X takes one video per post and cannot mix it with pictures.
+            if not wanted:
+                wanted.append(message)
+            break
+        if len(wanted) < 4:
+            wanted.append(message)
+    if not text and not wanted:
         return None
     client = await asyncio.to_thread(_client)
     media = []
-    for message in messages:
-        if message.photo and len(media) >= 4:
-            continue
-        if media and (message.video or message.animation):
-            break
-        descriptor = await _media_descriptor(message, client)
+    for message in wanted:
+        descriptor = await _media_with_retry(message, client)
         if descriptor:
             media.append(descriptor)
-            if message.video or message.animation:
-                break
+    if len(media) < len(wanted):
+        log.error('Schedchie X post for %s has %d of %d media; posting what uploaded',
+                  source, len(media), len(wanted))
+    if not text and not media:
+        return None
     account_id = os.environ['SCHEDCHIE_X_ACCOUNT_ID']
     now = int(time.time())
     with _database() as db:
@@ -148,6 +197,15 @@ async def publish(messages, text):
     return post_id
 
 
+def _failure_reason(post):
+    reasons = []
+    for item in post.get('publishResults') or []:
+        if isinstance(item, dict) and item.get('success') is not True:
+            reasons.append(str(item.get('error') or item.get('message') or item.get('errorMessage') or item))
+    reasons.append(str(post.get('error') or post.get('errorMessage') or ''))
+    return '; '.join(r for r in reasons if r)[:500] or 'no reason given'
+
+
 def reconcile(limit=25):
     """Check remote delivery; a failed post is recorded, never blindly resubmitted."""
     with _database() as db:
@@ -171,6 +229,7 @@ def reconcile(limit=25):
                     status == 'COMPLETED' and isinstance(results, list) and results and
                     all(isinstance(item, dict) and item.get('success') is False for item in results)):
                 state = 'failed'
+                log.error('Schedchie X post %s failed on X: %s', row['post_id'], _failure_reason(post))
             else:
                 continue
             with _database() as db:

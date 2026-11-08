@@ -15,6 +15,7 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from multi_owner_setup import MultiOwnerSetupBuilder
 from poster import is_too_long_error, split_thread
 from processor import process
+from telegram_media import check_downloadable, media_source
 import publer_x
 import schedchie_x
 
@@ -148,12 +149,21 @@ def _upload(path, media_type, category):
     return media_id
 
 
-async def _grab(tg_file, suffix, media_type, category):
+async def _grab(source, suffix, media_type, category):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.close()
     try:
+        check_downloadable(source)
+        tg_file = await source.get_file()
         await tg_file.download_to_drive(tmp.name)
-        return await asyncio.to_thread(_upload, tmp.name, media_type, category)
+        for attempt in range(1, 4):
+            try:
+                return await asyncio.to_thread(_upload, tmp.name, media_type, category)
+            except Exception as exc:
+                if attempt == 3:
+                    raise
+                log.warning("media upload attempt %d failed: %s", attempt, exc)
+                await asyncio.sleep(2 * attempt)
     except Exception as exc:
         log.error("media failed: %s", exc)
         return None
@@ -168,17 +178,20 @@ async def collect_media(msgs):
     items = []
     photo_count = 0
     for m in msgs:
-        if m.photo:
+        found = media_source(m)
+        if not found:
+            continue
+        source, extension, mime, kind = found
+        if kind == "photo":
             if photo_count >= 4:
                 log.warning("skipping extra album photo (X allows 4 images per post)")
                 continue
-            mid = await _grab(await m.photo[-1].get_file(), ".jpg", "image/jpeg", "tweet_image")
+            mid = await _grab(source, "." + extension, mime, "tweet_image")
             if mid:
                 items.append((mid, "photo"))
                 photo_count += 1
-        elif m.video or m.animation:
-            src = m.video or m.animation
-            mid = await _grab(await src.get_file(), ".mp4", "video/mp4", "tweet_video")
+        else:
+            mid = await _grab(source, "." + extension, mime, "tweet_video")
             if mid:
                 items.append((mid, "video"))
     return items
@@ -318,6 +331,10 @@ async def handle(msgs):
             log.exception('Schedchie X submission needs review; it will not be retried blindly')
         return
     items = await collect_media(msgs)
+    kinds = [found[3] for found in map(media_source, msgs) if found]
+    expected = min(kinds.count("photo"), 4) + kinds.count("video")
+    if len(items) < expected:
+        log.error("only %d of %d media uploaded to X; posting without the rest", len(items), expected)
     groups = _batch(items)
     if not text and not groups:
         return
