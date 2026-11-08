@@ -149,6 +149,31 @@ def _upload(path, media_type, category):
     return media_id
 
 
+def _upload_simple(path, media_type, category):
+    """One-request image upload (POST /2/media/upload), used if chunked upload fails."""
+    with open(path, "rb") as fh:
+        r = requests.post(
+            MEDIA_URL,
+            auth=_oauth,
+            data={"media_category": category, "media_type": media_type},
+            files={"media": ("media", fh, media_type)},
+            timeout=120,
+        )
+    if r.status_code >= 400:
+        raise RuntimeError("simple upload %s %s" % (r.status_code, r.text[:200]))
+    return _media_id(r.json())
+
+
+def _upload_any(path, media_type, category):
+    try:
+        return _upload(path, media_type, category)
+    except Exception as exc:
+        if category != "tweet_image":
+            raise
+        log.error("chunked image upload failed (%s); trying simple upload", exc)
+        return _upload_simple(path, media_type, category)
+
+
 async def _grab(source, suffix, media_type, category):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.close()
@@ -158,7 +183,7 @@ async def _grab(source, suffix, media_type, category):
         await tg_file.download_to_drive(tmp.name)
         for attempt in range(1, 4):
             try:
-                return await asyncio.to_thread(_upload, tmp.name, media_type, category)
+                return await asyncio.to_thread(_upload_any, tmp.name, media_type, category)
             except Exception as exc:
                 if attempt == 3:
                     raise

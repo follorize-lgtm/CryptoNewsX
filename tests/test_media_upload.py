@@ -95,5 +95,31 @@ class MediaUploadTests(unittest.TestCase):
         self.assertEqual(api.status_calls, [])
 
 
+    def test_image_falls_back_to_simple_upload_when_chunked_fails(self):
+        calls = []
+
+        def post(url, **kwargs):
+            calls.append(url)
+            if url.endswith("/initialize"):
+                return _response(403, {"title": "Forbidden"})
+            if url == main.MEDIA_URL:
+                return _response(200, {"data": {"id": "777"}})
+            return _response(404, {})
+
+        api = MagicMock()
+        api.post = post
+        with patch.object(main, "requests", api):
+            media_id = main._upload_any("/dev/null", "image/jpeg", "tweet_image")
+
+        self.assertEqual(media_id, "777")
+        self.assertEqual(calls, [main.MEDIA_URL + "/initialize", main.MEDIA_URL])
+
+    def test_video_does_not_use_simple_upload(self):
+        api = MagicMock()
+        api.post = lambda url, **kwargs: _response(403, {"title": "Forbidden"})
+        with patch.object(main, "requests", api), self.assertRaises(RuntimeError):
+            main._upload_any("/dev/null", "video/mp4", "tweet_video")
+
+
 if __name__ == "__main__":
     unittest.main()
